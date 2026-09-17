@@ -2246,23 +2246,32 @@ class OpenRAEnvironment(MCPEnvironment):
                 all_commands = []
                 action_names = []
                 for action in actions:
+                    tool = action.get("tool", "?")
                     cmds = env._action_to_commands(action, obs)
-                    all_commands.extend(cmds)
-                    action_names.append(action.get("tool", "?"))
+                    if cmds:
+                        all_commands.extend(cmds)
+                        action_names.append(tool)
+                    else:
+                        action_names.append(f"{tool}:FAILED")
 
-                if all_commands:
-                    try:
-                        result = env._execute_commands(all_commands)
-                        if result.get("done"):
-                            execution_log.append(
-                                f"Step {step_num}: {', '.join(action_names)} -> game over"
-                            )
-                            break
-                    except Exception as e:
+                if not all_commands:
+                    execution_log.append(
+                        f"Step {step_num}: {', '.join(action_names)} FAILED (no valid commands)"
+                    )
+                    continue
+
+                try:
+                    result = env._execute_commands(all_commands)
+                    if result.get("done"):
                         execution_log.append(
-                            f"Step {step_num}: {', '.join(action_names)} -> ERROR {e}"
+                            f"Step {step_num}: {', '.join(action_names)} -> game over"
                         )
                         break
+                except Exception as e:
+                    execution_log.append(
+                        f"Step {step_num}: {', '.join(action_names)} -> ERROR {e}"
+                    )
+                    break
 
                 execution_log.append(f"Step {step_num}: {', '.join(action_names)} OK")
 
@@ -2498,6 +2507,21 @@ class OpenRAEnvironment(MCPEnvironment):
 
     def _action_to_commands(self, action: dict, obs: dict) -> list[CommandModel]:
         """Convert a plan action dict to a list of CommandModel objects."""
+        # ID coercion: LLM planners often emit numeric IDs as strings
+        # (e.g. "unit_id": "364") while observations carry ints
+        # (actor_id: 364). Strict `==` then misses and yields empty
+        # commands. Normalize singular *_id fields up front so every
+        # branch below (deploy/harvest/set_rally_point/repair/cancel…)
+        # compares int-to-int. `unit_ids` (plural selector string like
+        # "155,160"/"all_combat") is deliberately left untouched —
+        # `_resolve_unit_ids` already handles strings.
+        action = dict(action)
+        for _k, _v in list(action.items()):
+            if _k.endswith("_id") and not _k.endswith("_ids") and isinstance(_v, str):
+                try:
+                    action[_k] = int(_v.strip())
+                except (ValueError, AttributeError):
+                    pass
         tool = action.get("tool", "")
         unit_ids = self._resolve_unit_ids(action.get("unit_ids", []), obs)
         queued = action.get("queued", False)
