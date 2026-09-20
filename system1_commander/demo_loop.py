@@ -25,8 +25,15 @@ from datetime import datetime, timezone
 
 def _parse_args(argv=None):
     p = argparse.ArgumentParser(description="System1 commander demo loop (P0).")
-    p.add_argument("--backend", choices=["scripted", "jev", "nanojev"], default="scripted")
+    p.add_argument("--backend", choices=["scripted", "jev", "nanojev", "laya"], default="scripted")
     p.add_argument("--state", choices=["combat", "eco"], default="combat")
+    p.add_argument("--mix", default="",
+                   help="Comma list to alternate states per decision, e.g. 'eco,combat'. "
+                        "Overrides --state when set.")
+    p.add_argument("--play-to-end", action="store_true",
+                   help="Loop until done/result; surrender at --max-ticks.")
+    p.add_argument("--max-ticks", type=int, default=15000,
+                   help="Tick budget for --play-to-end (~10 game-minutes); overruns surrender.")
     p.add_argument("--ticks-per-decision", type=int, default=25)
     p.add_argument("--max-decisions", type=int, default=4)
     p.add_argument("--log-dir", default=".runs/system1-p0")
@@ -44,6 +51,9 @@ def _make_backend(name: str):
     if name == "nanojev":
         from system1_commander.backend_nanojev import NanoJevBackend
         return NanoJevBackend()
+    if name == "laya":
+        from system1_commander.backend_laya import LayaBackend
+        return LayaBackend()
     raise ValueError(f"unknown backend: {name}")
 
 
@@ -69,14 +79,23 @@ async def run(args) -> dict:
     from openra_env.mcp_ws_client import OpenRAMCPClient
 
     backend = _make_backend(args.backend)
-    candidates = list_combat_candidates() if args.state == "combat" else list_eco_candidates()
-    by_name = {c.name: c for c in candidates}
-    build_state = build_combat_state if args.state == "combat" else build_eco_state
+    kinds = [k.strip() for k in args.mix.split(",") if k.strip()] or [args.state]
+    for k in kinds:
+        if k not in ("combat", "eco"):
+            raise ValueError(f"--mix/--state kind must be combat|eco, got {k!r}")
+    pools = {"combat": list_combat_candidates(), "eco": list_eco_candidates()}
+    builders = {"combat": build_combat_state, "eco": build_eco_state}
+    gate_cfg = GateConfig()
+    if args.play_to_end:
+        decision_cap = args.max_ticks // max(1, args.ticks_per_decision) + 20
+    else:
+        decision_cap = args.max_decisions
 
     t_start = time.monotonic()
     latencies, costs, state_toks = [], [], []
     decisions_log = []
-    game_done, game_result = False, ""
+    gate_modes, kinds_used = [], []
+    game_done, game_result, surrendered = False, "", False
 
     async with OpenRAMCPClient(base_url=args.url, message_timeout_s=300.0) as client:
         ex = Executor(client)
@@ -105,20 +124,57 @@ async def run(args) -> dict:
             if deploy_rec is not None:
                 f_orders.write(json.dumps({"kind": "deploy", **deploy_rec.to_dict()}) + "\n")
 
-            for i in range(args.max_decisions):
+            for i in range(decision_cap):
                 gs, units, buildings = await ex.fetch_raw()
                 snap = build_snapshot(gs, units, buildings)
                 if isinstance(gs, dict) and gs.get("done"):
                     game_done, game_result = True, str(gs.get("result", ""))
                     print(f"[demo] game over: {game_result}", flush=True)
                     break
-                state = build_state(snap)
+                if args.play_to_end and snap.tick >= args.max_ticks:
+                    print(f"[demo] tick budget {args.max_ticks} hit at tick={snap.tick}; "
+                          f"surrendering", flush=True)
+                    try:
+                        await ex.tool("surrender")
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[demo] surrender tool failed: {e}", flush=True)
+                    surrendered = True
+                    # Drain to game end so the engine flushes the replay:
+                    # surrender alone only queues the order; ticks must advance
+                    # for done=True. Cap 8x25=200 ticks, then give up honestly.
+                    for _ in range(8):
+                        try:
+                            await ex.advance(25)
+                        except Exception as e:  # noqa: BLE001
+                            print(f"[demo] drain advance failed: {e}", flush=True)
+                            break
+                        gs, units, buildings = await ex.fetch_raw()
+                        if isinstance(gs, dict) and gs.get("done"):
+                            game_done, game_result = True, str(gs.get("result", ""))
+                            print(f"[demo] game over after surrender: {game_result}",
+                                  flush=True)
+                            break
+                    else:
+                        print("[demo] drain budget exhausted, game not done; "
+                              "continuing without done flag", flush=True)
+                    gs, units, buildings = await ex.fetch_raw()
+                    snap_end_probe = build_snapshot(gs, units, buildings)
+                    game_result = str(gs.get("result", "") or game_result)
+                    game_done = bool(isinstance(gs, dict) and gs.get("done"))
+                    snap = snap_end_probe
+                    break
+                kind = kinds[i % len(kinds)]
+                candidates = pools[kind]
+                by_name = {c.name: c for c in candidates}
+                state = builders[kind](snap)
                 state_json, toks = state_to_json(state)
                 state_toks.append(toks)
                 pred = await asyncio.to_thread(backend.predict, state, candidates)
                 latencies.append(pred.latency_ms)
                 costs.append(pred.cost_usd)
-                gate = apply_gate(pred, candidates, _make_backend("scripted"), state, GateConfig())
+                gate = apply_gate(pred, candidates, _make_backend("scripted"), state, gate_cfg)
+                gate_modes.append(gate.mode)
+                kinds_used.append(kind)
                 actions = by_name[gate.choice_name].actions(snap)
                 guard_actions = by_name["guard_choke"].actions(snap) if "guard_choke" in by_name else None
                 rec = await ex.execute(gate.choice_name, actions, snap.tick, guard_actions)
@@ -127,6 +183,7 @@ async def run(args) -> dict:
                 rec.advance_interrupted = interrupted
                 entry = {
                     "kind": "decision", "i": i, "tick": snap.tick,
+                    "state_kind": kind,
                     "state_tokens": toks,
                     "prediction": pred.to_dict(), "gate": gate.to_dict(),
                     **rec.to_dict(),
@@ -134,7 +191,7 @@ async def run(args) -> dict:
                 f_orders.write(json.dumps(entry) + "\n")
                 f_orders.flush()
                 decisions_log.append(entry)
-                print(f"[demo] d{i}: tick={snap.tick} toks={toks} "
+                print(f"[demo] d{i}: tick={snap.tick} [{kind}] toks={toks} "
                       f"pred={pred.choice}@{pred.confidence:.2f} gate={gate.mode}:{gate.choice_name} "
                       f"batch_ok={rec.batch_ok} adv={moved}{'!' if interrupted else ''} "
                       f"{pred.latency_ms:.0f}ms ${pred.cost_usd:.6f}", flush=True)
@@ -165,9 +222,17 @@ async def run(args) -> dict:
 
     wall_s = time.monotonic() - t_start
     bench = {
-        "backend": args.backend, "state_kind": args.state,
+        "backend": args.backend,
+        "state_kind": f"mix:{','.join(kinds)}" if args.mix else args.state,
         "ticks_per_decision": args.ticks_per_decision,
+        "play_to_end": args.play_to_end, "max_ticks": args.max_ticks,
+        "surrendered": surrendered,
         "decisions": len(decisions_log),
+        "decisions_by_kind": {k: kinds_used.count(k) for k in set(kinds_used)},
+        "gate_rule": (f"execute if conf>= {gate_cfg.high} or top1-top2 margin>= {gate_cfg.margin_min}; "
+                      f"downgrade band [{gate_cfg.low},{gate_cfg.high}); else scripted fallback "
+                      f"(destructive needs conf>= {gate_cfg.destructive_min})"),
+        "gate_modes": {m: gate_modes.count(m) for m in set(gate_modes)},
         "ticks_total": snap_end.tick,
         "wall_s": round(wall_s, 1),
         "buildings_before": n_buildings_0, "buildings_after": len(snap_end.own_buildings),
