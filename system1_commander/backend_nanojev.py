@@ -13,6 +13,12 @@ nowhere near hit: 1 state / 1 question / <=9 paths per call.
 
 Trade-off: weights reload per predict() (~2.3GB). Slow but stateless and
 robust; fine for the taskC smoke. A persistent worker can come in taskD.
+
+Transport selection (2026-09-21 play-to-end):
+  - resident server (preferred for full games): NANOJEV_URL=http://127.0.0.1:8932
+    served by scripts/serve_nanojev.py (DecisionPredictor loads once; plain
+    urllib POST, stdlib only, no new deps in the driver venv).
+  - subprocess fallback: one nanojev-venv call per decision (~8s).
 """
 
 from __future__ import annotations
@@ -22,6 +28,7 @@ import os
 import subprocess
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 
 from system1_commander.backend_base import Prediction, System1Backend
@@ -33,6 +40,7 @@ DEFAULT_PREDICT_SCRIPT = (
     Path.home() / "Github" / "NanoJev" / "scripts" / "predict_toy_decisions.py"
 )
 SUBPROCESS_TIMEOUT_S = 600.0
+HTTP_TIMEOUT_S = 300.0
 
 
 def _resolve(name: str, explicit: str | None, default: str) -> str:
@@ -46,7 +54,9 @@ class NanoJevBackend(System1Backend):
                  python_bin: str | None = None,
                  predict_script: str | None = None,
                  timeout_s: float = SUBPROCESS_TIMEOUT_S,
-                 max_length: int | None = None):
+                 max_length: int | None = None,
+                 server_url: str | None = None):
+        self.server_url = server_url or os.environ.get("NANOJEV_URL", "")
         self.checkpoint_dir = _resolve("NANOJEV_CHECKPOINT_DIR", checkpoint_dir,
                                        DEFAULT_CHECKPOINT_DIR)
         self.python_bin = _resolve("NANOJEV_PYTHON", python_bin, DEFAULT_PYTHON_BIN)
@@ -54,6 +64,8 @@ class NanoJevBackend(System1Backend):
                                        str(DEFAULT_PREDICT_SCRIPT))
         self.timeout_s = timeout_s
         self.max_length = max_length
+        if self.server_url:
+            return  # resident server owns weights; nothing local to check
         problems = [
             f"{label} missing: {path}"
             for label, path in (
@@ -67,6 +79,8 @@ class NanoJevBackend(System1Backend):
             raise RuntimeError("NanoJevBackend unavailable: " + "; ".join(problems))
 
     def _run_checkpoint(self, payload: dict) -> dict:
+        if self.server_url:
+            return self._run_http(payload)
         with tempfile.TemporaryDirectory(prefix="nanojev-req-") as tmp:
             req = Path(tmp) / "request.json"
             req.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -95,6 +109,18 @@ class NanoJevBackend(System1Backend):
                 raise RuntimeError(
                     f"NanoJev inference returned unparsable stdout: "
                     f"{proc.stdout[:300]!r}") from e
+
+    def _run_http(self, payload: dict) -> dict:
+        req = urllib.request.Request(
+            self.server_url.rstrip("/") + "/predict",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as r:
+                return json.loads(r.read().decode())
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"NanoJev server call failed: {e}") from e
 
     def predict(self, state: dict, candidates: list[Candidate]) -> Prediction:
         t0 = time.monotonic()
@@ -137,6 +163,7 @@ class NanoJevBackend(System1Backend):
         name_set = set(names)
         detail: dict = {
             "checkpoint_dir": self.checkpoint_dir,
+            "transport": "http" if self.server_url else "subprocess",
             "execution": result.get("execution", {}),
         }
         if choice not in name_set:

@@ -38,6 +38,9 @@ def _parse_args(argv=None):
     p.add_argument("--max-decisions", type=int, default=4)
     p.add_argument("--log-dir", default=".runs/system1-p0")
     p.add_argument("--url", default="http://localhost:8000")
+    p.add_argument("--map", default="pitfight.oramap",
+                   help="Map for the match. Explicit (not server default) so reruns "
+                        "stay comparable after container rebuilds.")
     return p.parse_args(argv)
 
 
@@ -70,6 +73,7 @@ async def run(args) -> dict:
     )
     from system1_commander.executor import Executor
     from system1_commander.gate import GateConfig
+    from system1_commander.state import Snapshot
 
     os.makedirs(args.log_dir, exist_ok=True)
     orders_path = os.path.join(args.log_dir, "orders.jsonl")
@@ -96,116 +100,156 @@ async def run(args) -> dict:
     decisions_log = []
     gate_modes, kinds_used = [], []
     game_done, game_result, surrendered = False, "", False
+    error_note = ""
+    n_buildings_0, mil0 = 0, (0, 0, 0, 0, 0)
+    last_snap, snap_end, replay_info = None, None, ""
 
-    async with OpenRAMCPClient(base_url=args.url, message_timeout_s=300.0) as client:
-        ex = Executor(client)
-        print(f"[demo] reset @ {args.url} ...", flush=True)
-        await client.reset()
-        # Warmup: freshly reset games spawn empty (tick 0); advance so the
-        # MCV / starting units exist before the first snapshot.
-        await ex.advance(25)
-        gs, units, buildings = await ex.fetch_raw()
-        snap = build_snapshot(gs, units, buildings)
-        n_buildings_0 = len(snap.own_buildings)
-        mil0 = (snap.kills, snap.losses, snap.kills_cost, snap.deaths_cost, snap.order_count)
-        print(f"[demo] start: tick={snap.tick} map={snap.map_name or '?'} "
-              f"units={len(snap.own_units)} buildings={n_buildings_0} "
-              f"mcv={snap.mcv_id} fact={snap.has_fact}", flush=True)
-
-        deploy_rec = await ex.ensure_deployed(snap)
-        if deploy_rec is not None:
-            print(f"[demo] deploy_mcv: ok={deploy_rec.batch_ok} note={deploy_rec.batch_note[:120]}",
-                  flush=True)
+    try:
+        async with OpenRAMCPClient(base_url=args.url, message_timeout_s=300.0) as client:
+            ex = Executor(client)
+            print(f"[demo] reset @ {args.url} map={args.map} ...", flush=True)
+            await client.reset(map_name=args.map)
+            # Unpause: a fresh match starts paused (world created, tick ~3).
+            # try-agent uses start+end planning to launch; we run no planning,
+            # so open/close it immediately to start the match clock.
+            try:
+                await ex.tool("start_planning_phase")
+            except Exception as e:  # noqa: BLE001
+                print(f"[demo] start_planning_phase note: {e}", flush=True)
+            try:
+                await ex.tool("end_planning_phase", strategy="system1 demo: no central plan")
+            except Exception as e:  # noqa: BLE001
+                print(f"[demo] end_planning_phase note: {e}", flush=True)
+            # Cold container: dotnet JIT + map load takes ~1-2 min. Poll until
+            # the match exists (units spawned); advancing too early fails.
+            ready_snap = None
+            for _ in range(60):
+                await asyncio.sleep(5)
+                try:
+                    gs, units, buildings = await ex.fetch_raw()
+                    ready_snap = build_snapshot(gs, units, buildings)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[demo] waiting for game... ({e})", flush=True)
+                    continue
+                if ready_snap.own_units or ready_snap.tick > 10:
+                    break
+                print(f"[demo] waiting for game... tick={ready_snap.tick} "
+                      f"units={len(ready_snap.own_units)}", flush=True)
+            else:
+                print("[demo] WARNING: game never looked ready; continuing anyway",
+                      flush=True)
+            # Warmup: freshly reset games spawn empty (tick 0); advance so the
+            # MCV / starting units exist before the first snapshot.
+            await ex.advance(25)
             gs, units, buildings = await ex.fetch_raw()
             snap = build_snapshot(gs, units, buildings)
-            print(f"[demo] post-deploy: buildings={len(snap.own_buildings)}", flush=True)
+            n_buildings_0 = len(snap.own_buildings)
+            mil0 = (snap.kills, snap.losses, snap.kills_cost, snap.deaths_cost, snap.order_count)
+            print(f"[demo] start: tick={snap.tick} map={snap.map_name or '?'} "
+                  f"units={len(snap.own_units)} buildings={n_buildings_0} "
+                  f"mcv={snap.mcv_id} fact={snap.has_fact}", flush=True)
 
-        with open(orders_path, "w") as f_orders:
+            deploy_rec = await ex.ensure_deployed(snap)
             if deploy_rec is not None:
-                f_orders.write(json.dumps({"kind": "deploy", **deploy_rec.to_dict()}) + "\n")
-
-            for i in range(decision_cap):
+                print(f"[demo] deploy_mcv: ok={deploy_rec.batch_ok} note={deploy_rec.batch_note[:120]}",
+                      flush=True)
                 gs, units, buildings = await ex.fetch_raw()
                 snap = build_snapshot(gs, units, buildings)
-                if isinstance(gs, dict) and gs.get("done"):
-                    game_done, game_result = True, str(gs.get("result", ""))
-                    print(f"[demo] game over: {game_result}", flush=True)
-                    break
-                if args.play_to_end and snap.tick >= args.max_ticks:
-                    print(f"[demo] tick budget {args.max_ticks} hit at tick={snap.tick}; "
-                          f"surrendering", flush=True)
-                    try:
-                        await ex.tool("surrender")
-                    except Exception as e:  # noqa: BLE001
-                        print(f"[demo] surrender tool failed: {e}", flush=True)
-                    surrendered = True
-                    # Drain to game end so the engine flushes the replay:
-                    # surrender alone only queues the order; ticks must advance
-                    # for done=True. Cap 8x25=200 ticks, then give up honestly.
-                    for _ in range(8):
-                        try:
-                            await ex.advance(25)
-                        except Exception as e:  # noqa: BLE001
-                            print(f"[demo] drain advance failed: {e}", flush=True)
-                            break
-                        gs, units, buildings = await ex.fetch_raw()
-                        if isinstance(gs, dict) and gs.get("done"):
-                            game_done, game_result = True, str(gs.get("result", ""))
-                            print(f"[demo] game over after surrender: {game_result}",
-                                  flush=True)
-                            break
-                    else:
-                        print("[demo] drain budget exhausted, game not done; "
-                              "continuing without done flag", flush=True)
-                    gs, units, buildings = await ex.fetch_raw()
-                    snap_end_probe = build_snapshot(gs, units, buildings)
-                    game_result = str(gs.get("result", "") or game_result)
-                    game_done = bool(isinstance(gs, dict) and gs.get("done"))
-                    snap = snap_end_probe
-                    break
-                kind = kinds[i % len(kinds)]
-                candidates = pools[kind]
-                by_name = {c.name: c for c in candidates}
-                state = builders[kind](snap)
-                state_json, toks = state_to_json(state)
-                state_toks.append(toks)
-                pred = await asyncio.to_thread(backend.predict, state, candidates)
-                latencies.append(pred.latency_ms)
-                costs.append(pred.cost_usd)
-                gate = apply_gate(pred, candidates, _make_backend("scripted"), state, gate_cfg)
-                gate_modes.append(gate.mode)
-                kinds_used.append(kind)
-                actions = by_name[gate.choice_name].actions(snap)
-                guard_actions = by_name["guard_choke"].actions(snap) if "guard_choke" in by_name else None
-                rec = await ex.execute(gate.choice_name, actions, snap.tick, guard_actions)
-                moved, interrupted = await ex.advance(args.ticks_per_decision)
-                rec.advance_ticks = moved
-                rec.advance_interrupted = interrupted
-                entry = {
-                    "kind": "decision", "i": i, "tick": snap.tick,
-                    "state_kind": kind,
-                    "state_tokens": toks,
-                    "prediction": pred.to_dict(), "gate": gate.to_dict(),
-                    **rec.to_dict(),
-                }
-                f_orders.write(json.dumps(entry) + "\n")
-                f_orders.flush()
-                decisions_log.append(entry)
-                print(f"[demo] d{i}: tick={snap.tick} [{kind}] toks={toks} "
-                      f"pred={pred.choice}@{pred.confidence:.2f} gate={gate.mode}:{gate.choice_name} "
-                      f"batch_ok={rec.batch_ok} adv={moved}{'!' if interrupted else ''} "
-                      f"{pred.latency_ms:.0f}ms ${pred.cost_usd:.6f}", flush=True)
-                if game_done:
-                    break
+                print(f"[demo] post-deploy: buildings={len(snap.own_buildings)}", flush=True)
 
-        gs, units, buildings = await ex.fetch_raw()
-        snap_end = build_snapshot(gs, units, buildings)
-        replay_info = ""
-        try:
-            r = await ex.tool("get_replay_path")
-            replay_info = r if isinstance(r, str) else json.dumps(r)
-        except Exception as e:  # noqa: BLE001
-            replay_info = f"get_replay_path failed: {e}"
+            with open(orders_path, "w") as f_orders:
+                if deploy_rec is not None:
+                    f_orders.write(json.dumps({"kind": "deploy", **deploy_rec.to_dict()}) + "\n")
+
+                for i in range(decision_cap):
+                    gs, units, buildings = await ex.fetch_raw()
+                    snap = build_snapshot(gs, units, buildings)
+                    last_snap = snap
+                    if isinstance(gs, dict) and gs.get("done"):
+                        game_done, game_result = True, str(gs.get("result", ""))
+                        print(f"[demo] game over: {game_result}", flush=True)
+                        break
+                    if args.play_to_end and snap.tick >= args.max_ticks:
+                        print(f"[demo] tick budget {args.max_ticks} hit at tick={snap.tick}; "
+                              f"surrendering", flush=True)
+                        try:
+                            await ex.tool("surrender")
+                        except Exception as e:  # noqa: BLE001
+                            print(f"[demo] surrender tool failed: {e}", flush=True)
+                        surrendered = True
+                        # Drain to game end so the engine flushes the replay:
+                        # surrender alone only queues the order; ticks must advance
+                        # for done=True. Cap 8x25=200 ticks, then give up honestly.
+                        for _ in range(8):
+                            try:
+                                await ex.advance(25)
+                            except Exception as e:  # noqa: BLE001
+                                print(f"[demo] drain advance failed: {e}", flush=True)
+                                break
+                            gs, units, buildings = await ex.fetch_raw()
+                            if isinstance(gs, dict) and gs.get("done"):
+                                game_done, game_result = True, str(gs.get("result", ""))
+                                print(f"[demo] game over after surrender: {game_result}",
+                                      flush=True)
+                                break
+                        else:
+                            print("[demo] drain budget exhausted, game not done; "
+                                  "continuing without done flag", flush=True)
+                        gs, units, buildings = await ex.fetch_raw()
+                        snap_end_probe = build_snapshot(gs, units, buildings)
+                        game_result = str(gs.get("result", "") or game_result)
+                        game_done = bool(isinstance(gs, dict) and gs.get("done"))
+                        snap = snap_end_probe
+                        break
+                    kind = kinds[i % len(kinds)]
+                    candidates = pools[kind]
+                    by_name = {c.name: c for c in candidates}
+                    state = builders[kind](snap)
+                    state_json, toks = state_to_json(state)
+                    state_toks.append(toks)
+                    pred = await asyncio.to_thread(backend.predict, state, candidates)
+                    latencies.append(pred.latency_ms)
+                    costs.append(pred.cost_usd)
+                    gate = apply_gate(pred, candidates, _make_backend("scripted"), state, gate_cfg)
+                    gate_modes.append(gate.mode)
+                    kinds_used.append(kind)
+                    actions = by_name[gate.choice_name].actions(snap)
+                    guard_actions = by_name["guard_choke"].actions(snap) if "guard_choke" in by_name else None
+                    rec = await ex.execute(gate.choice_name, actions, snap.tick, guard_actions)
+                    moved, interrupted = await ex.advance(args.ticks_per_decision)
+                    rec.advance_ticks = moved
+                    rec.advance_interrupted = interrupted
+                    entry = {
+                        "kind": "decision", "i": i, "tick": snap.tick,
+                        "state_kind": kind,
+                        "state_tokens": toks,
+                        "prediction": pred.to_dict(), "gate": gate.to_dict(),
+                        **rec.to_dict(),
+                    }
+                    f_orders.write(json.dumps(entry) + "\n")
+                    f_orders.flush()
+                    decisions_log.append(entry)
+                    print(f"[demo] d{i}: tick={snap.tick} [{kind}] toks={toks} "
+                          f"pred={pred.choice}@{pred.confidence:.2f} gate={gate.mode}:{gate.choice_name} "
+                          f"batch_ok={rec.batch_ok} adv={moved}{'!' if interrupted else ''} "
+                          f"{pred.latency_ms:.0f}ms ${pred.cost_usd:.6f}", flush=True)
+                    if game_done:
+                        break
+
+            gs, units, buildings = await ex.fetch_raw()
+            snap_end = build_snapshot(gs, units, buildings)
+            try:
+                r = await ex.tool("get_replay_path")
+                replay_info = r if isinstance(r, str) else json.dumps(r)
+            except Exception as e:  # noqa: BLE001
+                replay_info = f"get_replay_path failed: {e}"
+    except Exception as e:  # noqa: BLE001
+        # Crash mid-game (e.g. server restarted): keep partial orders + bench.
+        error_note = f"{type(e).__name__}: {e}"[:300]
+        print(f"[demo] CRASHED, writing partial bench: {error_note}", flush=True)
+
+    if snap_end is None:
+        snap_end = last_snap if last_snap is not None else Snapshot()
 
     replay_hash = ""
     for token in replay_info.replace('"', " ").replace("'", " ").split():
@@ -223,10 +267,12 @@ async def run(args) -> dict:
     wall_s = time.monotonic() - t_start
     bench = {
         "backend": args.backend,
+        "map": snap_end.map_name,
         "state_kind": f"mix:{','.join(kinds)}" if args.mix else args.state,
         "ticks_per_decision": args.ticks_per_decision,
         "play_to_end": args.play_to_end, "max_ticks": args.max_ticks,
         "surrendered": surrendered,
+        "crashed": bool(error_note), "error": error_note,
         "decisions": len(decisions_log),
         "decisions_by_kind": {k: kinds_used.count(k) for k in set(kinds_used)},
         "gate_rule": (f"execute if conf>= {gate_cfg.high} or top1-top2 margin>= {gate_cfg.margin_min}; "

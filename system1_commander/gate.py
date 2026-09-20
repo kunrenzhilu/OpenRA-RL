@@ -12,9 +12,15 @@ DOWNGRADE_ORDER = ("guard_choke", "hold_position", "wait")
 
 @dataclass
 class GateConfig:
-    high: float = 0.7
-    low: float = 0.4
+    # Recalibrated 2026-09-21 from P1 evidence (system1-p1-jev-eco):
+    # Jev correct decisions (build_powr) came at conf 0.37-0.54 with
+    # top1-top2 margin 0.16-0.42, so the old high=0.70 killed every eco
+    # decision (all downgraded to wait, nothing ever built).
+    # New rule: execute if conf >= high (0.40) OR margin >= margin_min.
+    high: float = 0.40
+    low: float = 0.25
     destructive_min: float = 0.9
+    margin_min: float = 0.15
 
 
 @dataclass
@@ -25,6 +31,14 @@ class GateDecision:
 
     def to_dict(self) -> dict:
         return {"mode": self.mode, "choice": self.choice_name, "reason": self.reason}
+
+
+def top1_margin(probs: dict) -> float:
+    """Top1-top2 probability gap; 1.0 when there is a single candidate."""
+    vals = sorted((float(v) for v in (probs or {}).values()), reverse=True)
+    if len(vals) < 2:
+        return 1.0
+    return vals[0] - vals[1]
 
 
 def apply_gate(
@@ -45,12 +59,16 @@ def apply_gate(
         fb = scripted.predict(state, candidates)
         return GateDecision("fallback", fb.choice,
                             f"destructive '{pred.choice}' conf {pred.confidence:.2f} < {cfg.destructive_min}")
-    if pred.confidence >= cfg.high:
-        return GateDecision("execute", pred.choice, f"conf {pred.confidence:.2f} >= {cfg.high}")
+    if pred.confidence >= cfg.high or top1_margin(pred.probs) >= cfg.margin_min:
+        return GateDecision(
+            "execute", pred.choice,
+            f"conf {pred.confidence:.2f}>= {cfg.high} or "
+            f"margin {top1_margin(pred.probs):.2f}>= {cfg.margin_min}")
     if pred.confidence >= cfg.low:
         for name in DOWNGRADE_ORDER:
             if name in by_name:
                 return GateDecision("downgrade", name,
-                                    f"conf {pred.confidence:.2f} in [{cfg.low},{cfg.high}) -> {name}")
+                                    f"conf {pred.confidence:.2f} in [{cfg.low},{cfg.high}) "
+                                    f"margin {top1_margin(pred.probs):.2f} -> {name}")
     fb = scripted.predict(state, candidates)
     return GateDecision("fallback", fb.choice, f"conf {pred.confidence:.2f} < {cfg.low} -> scripted")

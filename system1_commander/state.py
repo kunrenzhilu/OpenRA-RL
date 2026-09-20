@@ -109,6 +109,16 @@ def _num(d: dict, key: str, default: int = 0) -> int:
         return default
 
 
+def _as_list(v):
+    """Server sometimes returns a scalar (e.g. production: 0/1) instead of a
+    list; coerce defensively so one odd field never kills a full game."""
+    if isinstance(v, list):
+        return v
+    if isinstance(v, tuple):
+        return list(v)
+    return []
+
+
 def build_snapshot(game_state: dict, units: list | None = None, buildings: list | None = None) -> Snapshot:
     """Merge tool outputs into a Snapshot. Missing keys degrade gracefully."""
     gs = game_state or {}
@@ -131,20 +141,20 @@ def build_snapshot(game_state: dict, units: list | None = None, buildings: list 
     snap.kd_ratio = round(snap.kills_cost / max(snap.deaths_cost, 1), 2)
 
     if units is not None:
-        snap.own_units = list(units)
+        snap.own_units = _as_list(units)
     else:
-        snap.own_units = list(gs.get("units_summary", []) or gs.get("units", []) or [])
+        snap.own_units = _as_list(gs.get("units_summary", []) or gs.get("units", []) or [])
     if buildings is not None:
-        snap.own_buildings = list(buildings)
+        snap.own_buildings = _as_list(buildings)
     else:
-        snap.own_buildings = list(gs.get("buildings_summary", []) or gs.get("buildings", []) or [])
-    snap.enemies = list(gs.get("enemy_summary", []) or gs.get("visible_enemies", []) or [])
-    snap.enemy_buildings = list(
+        snap.own_buildings = _as_list(gs.get("buildings_summary", []) or gs.get("buildings", []) or [])
+    snap.enemies = _as_list(gs.get("enemy_summary", []) or gs.get("visible_enemies", []) or [])
+    snap.enemy_buildings = _as_list(
         gs.get("enemy_buildings_summary", []) or gs.get("visible_enemy_buildings", []) or [])
-    snap.production = list(
+    snap.production = _as_list(
         gs.get("production", []) or gs.get("production_queues", []) or
         gs.get("production_items", []) or [])
-    snap.available_production = list(gs.get("available_production", []) or [])
+    snap.available_production = _as_list(gs.get("available_production", []) or [])
     try:
         snap.explored_percent = float(gs.get("explored_percent", 0.0) or 0.0)
     except (TypeError, ValueError):
