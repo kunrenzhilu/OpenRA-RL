@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 
 def _parse_args(argv=None):
     p = argparse.ArgumentParser(description="System1 commander demo loop (P0).")
-    p.add_argument("--backend", choices=["scripted", "jev"], default="scripted")
+    p.add_argument("--backend", choices=["scripted", "jev", "nanojev"], default="scripted")
     p.add_argument("--state", choices=["combat", "eco"], default="combat")
     p.add_argument("--ticks-per-decision", type=int, default=25)
     p.add_argument("--max-decisions", type=int, default=4)
@@ -41,6 +41,9 @@ def _make_backend(name: str):
     if name == "jev":
         from system1_commander.backend_jev import JevBackend
         return JevBackend()
+    if name == "nanojev":
+        from system1_commander.backend_nanojev import NanoJevBackend
+        return NanoJevBackend()
     raise ValueError(f"unknown backend: {name}")
 
 
