@@ -105,6 +105,9 @@ class Snapshot:
     # instead of parsing the production list itself.
     queue_blocked_by_unplaced: bool = False
     building_in_progress: bool = False
+    # Jev-max J1: raw ASCII minimap from get_game_state ("minimap" key,
+    # 23x23 server-side). Carried verbatim; capped at attach time.
+    minimap: str = ""
 
 
 def _num(d: dict, key: str, default: int = 0) -> int:
@@ -204,6 +207,8 @@ def build_snapshot(game_state: dict, units: list | None = None, buildings: list 
     except (TypeError, ValueError):
         snap.explored_percent = 0.0
     snap.reward_vector = dict(gs.get("reward_vector", {}) or {})
+    _mm = gs.get("minimap", "")
+    snap.minimap = _mm if isinstance(_mm, str) else ""
 
     facts = [b for b in snap.own_units + snap.own_buildings if b.get("type") == "fact"]
     snap.has_fact = len([b for b in snap.own_buildings if b.get("type") == "fact"]) > 0
@@ -320,15 +325,265 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
-def state_to_json(state: dict) -> tuple[str, int]:
-    """Serialize with budget enforcement (trim lists if over budget)."""
+def state_to_json(state: dict, budget: int = STATE_TOKEN_BUDGET) -> tuple[str, int]:
+    """Serialize with budget enforcement (trim lists if over budget).
+
+    Jev-max J1: budget is a parameter (plan §1 state ladder 800 -> 2k -> 4k);
+    default keeps the legacy 800. Rich keys trim first (minimap head-cut,
+    enemy_history to 2 rows) so the poor-state core survives.
+    """
     text = json.dumps(state, separators=(",", ":"))
     toks = estimate_tokens(text)
-    if toks <= STATE_TOKEN_BUDGET:
+    if toks <= budget:
         return text, toks
     trimmed = dict(state)
     for key in ("enemies", "own", "can_make", "production"):
         if isinstance(trimmed.get(key), list) and len(trimmed[key]) > 4:
             trimmed[key] = trimmed[key][:4]
+    if isinstance(trimmed.get("minimap"), str):
+        trimmed["minimap"] = trimmed["minimap"][:400]
+    _eh = trimmed.get("enemy_history")
+    if isinstance(_eh, dict) and isinstance(_eh.get("last_seen"), list):
+        _eh = dict(_eh)
+        _eh["last_seen"] = _eh["last_seen"][:2]
+        trimmed["enemy_history"] = _eh
     text = json.dumps(trimmed, separators=(",", ":"))
     return text, estimate_tokens(text)
+
+
+# ── Jev-max J1: rich-state fields (backend-agnostic; FROZEN set of five) ──
+# plan openra-taskC-jevmax-plan-20260921 §1. All arithmetic stays Python-side.
+# Field set is FROZEN (minerals / enemy_history / traj / phase / minimap);
+# do not add/remove. Over-cap lists trim OLDEST first.
+RICH_TOKEN_CAPS = {
+    "minerals": 120,
+    "enemy_history": 150,
+    "traj": 200,
+    "phase": 60,
+    "minimap": 200,
+}
+
+
+def _cap_text(text: str, cap_toks: int) -> str:
+    return text[: max(0, cap_toks * 4)]
+
+
+def _fits(obj: Any, cap_toks: int) -> bool:
+    return estimate_tokens(json.dumps(obj, separators=(",", ":"))) <= cap_toks
+
+
+def _trim_lists_oldest(obj: dict, list_keys: list[str], cap_toks: int) -> dict:
+    """Drop oldest (front) list items until the dict fits the token cap.
+
+    Convention: trimmed lists are stored oldest-first. At most one item per
+    key per pass, round-robin, so no single key is gutted first.
+    """
+    obj = dict(obj)
+    for k in list_keys:
+        if isinstance(obj.get(k), list):
+            obj[k] = list(obj[k])
+    while not _fits(obj, cap_toks):
+        dropped = False
+        for k in list_keys:
+            if isinstance(obj.get(k), list) and len(obj[k]) > 1:
+                obj[k] = obj[k][1:]
+                dropped = True
+        if not dropped:
+            break
+    return obj
+
+
+def _dir8(dx: int, dy: int) -> str:
+    """Coarse compass bucket of an offset (screen coords, y grows south)."""
+    if dx == 0 and dy == 0:
+        return "here"
+    ax, ay = abs(dx), abs(dy)
+    if ax >= 2 * ay:
+        return "E" if dx > 0 else "W"
+    if ay >= 2 * ax:
+        return "S" if dy > 0 else "N"
+    if dx > 0:
+        return "SE" if dy > 0 else "NE"
+    return "SW" if dy > 0 else "NW"
+
+
+class EnemyMemory:
+    """Last-seen record per enemy type (out of sight != never existed)."""
+
+    def __init__(self) -> None:
+        self._seen: dict[str, dict] = {}
+
+    def reset(self) -> None:
+        self._seen.clear()
+
+    def observe(self, snap: Snapshot) -> None:
+        by_type: dict[str, list] = {}
+        for e in snap.enemies:
+            by_type.setdefault(str(e.get("type", "?")), []).append(e)
+        for t, es in by_type.items():
+            # Representative cell: closest to our base (the sharp end).
+            rep = min(es, key=lambda e: chebyshev(
+                int(e.get("cell_x", 0) or 0), int(e.get("cell_y", 0) or 0),
+                snap.base_cell[0], snap.base_cell[1]))
+            self._seen[t] = {
+                "cell": (int(rep.get("cell_x", 0) or 0),
+                         int(rep.get("cell_y", 0) or 0)),
+                "tick": snap.tick,
+                "count": len(es),
+            }
+
+    def summarize(self, base_cell: tuple, now_tick: int) -> dict:
+        rows = []
+        for t, rec in self._seen.items():
+            cx, cy = rec["cell"]
+            dx, dy = cx - base_cell[0], cy - base_cell[1]
+            rows.append({
+                "t": t,
+                "dir": _dir8(dx, dy),
+                "dist": dist_bucket(chebyshev(cx, cy, base_cell[0], base_cell[1])),
+                "ago": now_tick - int(rec["tick"]),
+                "n": int(rec["count"]),
+                "_tick": int(rec["tick"]),
+            })
+        # Oldest-first for trim-oldest, then newest-first for the model.
+        rows.sort(key=lambda r: r["_tick"])
+        out: dict = {"last_seen": rows, "n_types": len(rows)}
+        out = _trim_lists_oldest(out, ["last_seen"],
+                                 RICH_TOKEN_CAPS["enemy_history"])
+        for r in out["last_seen"]:
+            r.pop("_tick", None)
+        out["last_seen"] = out["last_seen"][::-1]
+        out["n_types"] = len(out["last_seen"])
+        return out
+
+
+class TrajectoryTracker:
+    """Cumulative own-side trajectory: built-ever, cash curve, K/D, power."""
+
+    def __init__(self) -> None:
+        self.built: dict[str, int] = {}
+        self.cash_pts: list[int] = []
+        self.kills = 0
+        self.losses = 0
+        self.power_pts: list[int] = []
+        self.powr_n = 0
+
+    def reset(self) -> None:
+        self.__init__()
+
+    def observe(self, snap: Snapshot) -> None:
+        counts: dict[str, int] = {}
+        for b in snap.own_buildings:
+            t = str(b.get("type", "?"))
+            counts[t] = counts.get(t, 0) + 1
+        for t, c in counts.items():
+            self.built[t] = max(self.built.get(t, 0), c)
+        self.cash_pts.append(int(snap.cash) + int(snap.ore))
+        self.kills = int(snap.kills)
+        self.losses = int(snap.losses)
+        self.power_pts.append(int(snap.power_balance))
+        self.powr_n = counts.get("powr", 0)
+
+    def cash_curve(self, n: int = 5) -> list[int]:
+        pts = self.cash_pts
+        if not pts:
+            return []
+        if len(pts) <= n:
+            return list(pts)
+        idx = [round(i * (len(pts) - 1) / (n - 1)) for i in range(n)]
+        return [pts[j] for j in idx]
+
+    def power_trend(self) -> str:
+        pts = self.power_pts[-4:]
+        if len(pts) < 2:
+            return "flat"
+        d = pts[-1] - pts[0]
+        if d > 10:
+            return "up"
+        if d < -10:
+            return "down"
+        return "flat"
+
+    def summarize_traj(self) -> dict:
+        out: dict = {
+            "built": dict(sorted(self.built.items())),
+            "cash_curve": self.cash_curve(5),
+            "kills": self.kills,
+            "losses": self.losses,
+        }
+        # `built` has no age order; cash_curve is newest-valuable. Trim the
+        # curve from the front (oldest samples) if absurdly over cap.
+        return _trim_lists_oldest(out, ["cash_curve"],
+                                  RICH_TOKEN_CAPS["traj"])
+
+    def summarize_phase(self, tick: int) -> dict:
+        if tick < 3000:
+            stage = "early"
+        elif tick < 9000:
+            stage = "mid"
+        else:
+            stage = "late"
+        return {
+            "stage": stage,
+            "power_trend": self.power_trend(),
+            "powr": self.powr_n,
+            "tick": tick,
+        }
+
+
+def build_minerals(snap: Snapshot) -> dict:
+    """Ore picture. The server exposes no ore-field channel, so harvester
+    positions proxy the fields (harvesters sit on ore); offsets are
+    base-relative cells. Honest about the proxy in `src`."""
+    bx, by = snap.base_cell
+    harvs = [u for u in snap.own_units if u.get("type") == "harv"]
+    rel = [[int(u.get("cell_x", 0) or 0) - bx,
+            int(u.get("cell_y", 0) or 0) - by] for u in harvs[:4]]
+    nearest = None
+    if harvs:
+        h0 = min(harvs, key=lambda u: chebyshev(
+            int(u.get("cell_x", 0) or 0), int(u.get("cell_y", 0) or 0),
+            bx, by))
+        hx, hy = int(h0.get("cell_x", 0) or 0), int(h0.get("cell_y", 0) or 0)
+        nearest = {"dx": hx - bx, "dy": hy - by,
+                   "dist": dist_bucket(chebyshev(hx, hy, bx, by))}
+    return {
+        "ore": int(snap.ore),
+        "harv_n": len(harvs),
+        "harv_rel": rel,
+        "nearest": nearest,
+        "src": "harv-pos-proxy",
+    }
+
+
+# Module-singleton trackers: one game per process; demo_loop resets per run.
+_ENEMY_MEM = EnemyMemory()
+_TRAJ = TrajectoryTracker()
+
+
+def observe_trackers(snap: Snapshot) -> None:
+    """Feed one fresh snapshot into the J1 trackers (call per decision)."""
+    _ENEMY_MEM.observe(snap)
+    _TRAJ.observe(snap)
+
+
+def reset_trackers() -> None:
+    _ENEMY_MEM.reset()
+    _TRAJ.reset()
+
+
+def attach_rich_fields(state: dict, snap: Snapshot) -> dict:
+    """Return a copy of `state` plus the frozen five J1 rich fields.
+
+    Backend-agnostic: pure function of (poor state, snapshot, trackers).
+    Each field respects its RICH_TOKEN_CAPS entry (oldest trimmed).
+    """
+    out = dict(state)
+    out["minerals"] = _trim_lists_oldest(
+        build_minerals(snap), ["harv_rel"], RICH_TOKEN_CAPS["minerals"])
+    out["enemy_history"] = _ENEMY_MEM.summarize(snap.base_cell, snap.tick)
+    out["traj"] = _TRAJ.summarize_traj()
+    out["phase"] = _TRAJ.summarize_phase(snap.tick)
+    out["minimap"] = _cap_text(snap.minimap or "",
+                               RICH_TOKEN_CAPS["minimap"])
+    return out
