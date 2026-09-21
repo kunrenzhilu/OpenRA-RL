@@ -275,6 +275,11 @@ def _parse_args(argv=None):
                    help="Jevfix F5: two-phase combat decisions vote a combat "
                         "macro (defend_hold/probe_attack/all_in_commit) then "
                         "map onto atomic verbs. Needs --two-phase.")
+    # Jevfix narrowing (备选局独立路径；F1 实现只读复用，不改动).
+    p.add_argument("--narrow-commitment", action="store_true",
+                   help="Narrowing备选局: eco宏赢票后承诺 5 个eco决策内"
+                        "原子ballot缩为{映射首步,place_ready(如有),wait}逐tick照投; "
+                        "映射首步落地或到期则重投宏. 需--two-phase.")
     # Jev-max J3: goal routing (execute/fallback only, downgrade discarded).
     p.add_argument("--goal-route", action="store_true",
                    help="J3: route on the fan-out goal Choice (downgrade "
@@ -335,10 +340,14 @@ async def run(args) -> dict:
         COMBAT_MACRO_NAMES,
         MACRO_DEFAULT_ATOMIC,
         MACRO_WEAK_CONF,
+        NARROW_HORIZON,
         RULE1_PLACE_NAMES,
+        build_narrowed_ballot,
         iron_retired,
         list_combat_macros,
         list_macro_candidates,
+        narrow_next,
+        narrow_target_for_macro,
         resolve_macro_execution,
     )
 
@@ -395,6 +404,10 @@ async def run(args) -> dict:
     cost_phase2_usd = 0.0  # mapped execution issues no phase-2 call
     spawn_base_cell: list | None = None
     stop_after_decision = False
+    # Jevfix narrowing (备选局独立路径): eco-macro 承诺 {macro,target,
+    # remaining,weak,conf}；combat 决策不消费 budget（暂停而非推进），
+    # 到期/落地仅在 eco 缩票决策上结算。
+    narrow = None
 
     try:
         async with OpenRAMCPClient(base_url=args.url, message_timeout_s=300.0) as client:
@@ -530,6 +543,7 @@ async def run(args) -> dict:
                     abl_entry = None  # Jev-max J1: filled on sampled ticks.
                     mchoice, macro_entry = None, None  # Jev-max J2 / Jevfix F1.
                     macro_exec = None  # Jevfix F1: mapped-execution record.
+                    narrow_entry = None  # Jevfix narrowing: 缩票投票记录.
                     exec_tag = None  # Jevfix F1: place-first/demand-proxy/...
                     second_rec = None  # Jevfix F4E: second-choice record.
                     ds_rec = None  # Jevfix F4D: double-sample record.
@@ -558,6 +572,106 @@ async def run(args) -> dict:
                             f"COST-CAP ${args.cost_cap:.2f}: stop asking, save game",
                         )
                         actions = []
+                    elif args.narrow_commitment and macro_mode:
+                        # Jevfix narrowing (备选局独立路径；F1 只读复用):
+                        # 承诺外 → phase-1 宏投票（与 F1 同款记录：macro_entry /
+                        # counterfactual macro_exec / weak / iron_retired /
+                        # two_phase p95），随后本决策即做第一次缩票原子投票；
+                        # 承诺内 → 跳过宏投票，直接缩票原子投票。combat 不进
+                        # 此分支（budget 暂停）。每决策 1-2 次 Jev 调用；
+                        # 执行走 narrow-execute（直执行，不进 gate），与 F1 的
+                        # macro-execute 同级可比、模式名可区分。
+                        macro_taken = True
+                        _narrow_start = narrow is None
+                        if _narrow_start:
+                            _macros = eco_macros
+                            ballot_names = None  # macro ballot记入phase1
+                            pred1 = await asyncio.to_thread(
+                                backend.predict, state, _macros)
+                            cost_phase1_usd += pred1.cost_usd
+                            costs.append(pred1.cost_usd)
+                            _mnames = {m.name for m in _macros}
+                            mchoice = (pred1.choice if pred1.choice in _mnames
+                                       else _macros[0].name)
+                            macro_entry = {
+                                "choice": mchoice,
+                                "probs": pred1.probs,
+                                "confidence": pred1.confidence,
+                                "latency_ms": round(pred1.latency_ms, 1),
+                                "cost_usd": pred1.cost_usd,
+                                "ballot": sorted(_mnames),
+                            }
+                            two_phase_lat.append(pred1.latency_ms or 0.0)
+                            if len(two_phase_lat) >= 3:
+                                _p95 = sorted(two_phase_lat)[
+                                    max(0, int(len(two_phase_lat) * 0.95) - 1)]
+                                if _p95 > 4000.0:
+                                    two_phase_disabled_at = i
+                                    two_phase_stop_note = (
+                                        f"TWO-PHASE p95 {_p95:.0f}ms > 4000ms "
+                                        f"at d{i}; stopping (single-regime rule: "
+                                        "no mid-game revert, rerun single-phase)")
+                                    stop_after_decision = True
+                                    print(f"[demo] {two_phase_stop_note}",
+                                          flush=True)
+                            _target = narrow_target_for_macro(mchoice, snap)
+                            _weak = bool((pred1.confidence or 0.0)
+                                         < MACRO_WEAK_CONF)
+                            narrow = {"macro": mchoice, "target": _target,
+                                      "remaining": NARROW_HORIZON,
+                                      "weak": _weak,
+                                      "conf": pred1.confidence}
+                        else:
+                            _target = narrow["target"]
+                            mchoice = narrow["macro"]
+                            macro_entry = None
+                        # F1 counterfactual（只记录不执行）：同一宏在 F1 下
+                        # 本 tick 会走什么 tag（macro-wait% 可比口径）。
+                        _atomic, _acts, _tag = resolve_macro_execution(
+                            mchoice, snap, by_name, MACRO_DEFAULT_ATOMIC)
+                        macro_exec = {
+                            "macro": mchoice,
+                            "atomic": _atomic,
+                            "tag": _tag,
+                            "weak": (narrow["weak"] if narrow is not None
+                                     else False),
+                            "iron_retired": iron_retired(
+                                two_phase_on=True, kind=kind, phase2=True),
+                            "counterfactual": True,
+                        }
+                        exec_tag = f"narrow:{_tag}"
+                        _narrow_ballot = build_narrowed_ballot(
+                            _target, snap, by_name)
+                        ballot_names = [c.name for c in _narrow_ballot]
+                        _rem_before = int(narrow["remaining"])
+                        pred = await asyncio.to_thread(
+                            backend.predict, state, _narrow_ballot)
+                        _nbnames = {c.name for c in _narrow_ballot}
+                        _win = (pred.choice if pred.choice in _nbnames
+                                else _narrow_ballot[0].name)
+                        actions = by_name[_win].actions(snap)
+                        if _win.startswith("build_") and any(
+                                p.get("queue_type") == "Building"
+                                for p in (snap.production or [])):
+                            actions = []
+                        narrow_entry = {
+                            "macro": mchoice,
+                            "target": _target,
+                            "remaining_before": _rem_before,
+                            "ballot": sorted(_nbnames),
+                            "winner": _win,
+                            "vote_wait": bool(_win == "wait"),
+                        }
+                        gate = GateDecision(
+                            "narrow-execute", _win,
+                            f"narrow {mchoice}->{_target} "
+                            f"rem={_rem_before} vote={_win}",
+                        )
+                        fanout_rec = fanout_of(pred.detail)
+                        if not any(v is not None
+                                   for v in fanout_rec.values()):
+                            fanout_rec = None
+                        ds_state, ds_ballot = state, _narrow_ballot
                     elif macro_mode or combat_macro_mode:
                         # Jevfix F1/F5/F6: phase-1 macro vote, phase-2 mapped
                         # execution. NEVER re-votes: illegal/empty mappings
@@ -937,6 +1051,24 @@ async def run(args) -> dict:
                             entry["phase1"] = macro_entry
                         if macro_exec is not None:
                             entry["macro_exec"] = macro_exec
+                        if narrow_entry is not None and narrow is not None:
+                            # 落地按执行结果结算（目标原子 + 有动作 + batch_ok）；
+                            # 释放后 narrow 清零，下一个 eco 决策重投宏。
+                            _landed = bool(
+                                narrow_entry.get("winner") == narrow["target"]
+                                and rec.actions and rec.batch_ok)
+                            _after, _rel = narrow_next(
+                                remaining_before=narrow_entry[
+                                    "remaining_before"],
+                                landed=_landed)
+                            narrow_entry["landed"] = _landed
+                            narrow_entry["remaining_after"] = _after
+                            narrow_entry["released"] = _rel
+                            entry["narrow"] = narrow_entry
+                            if _rel is not None:
+                                narrow = None
+                            else:
+                                narrow["remaining"] = _after
                         if second_rec is not None:
                             entry["second_choice"] = second_rec
                         if ds_rec is not None:
@@ -1060,6 +1192,20 @@ async def run(args) -> dict:
                    if e.get("kind") == "decision"
                    and e.get("choice") == "build_weap" and e.get("batch_ok"))
     _second_rows = [e for e in decisions_log if e.get("second_choice")]
+    # Jevfix narrowing: 缩票投票统计（judge 从 orders.jsonl narrow 键重算）。
+    _narrow_rows = [e for e in decisions_log if e.get("narrow")]
+    _narrow_wait = sum(1 for e in _narrow_rows
+                       if (e.get("narrow") or {}).get("vote_wait"))
+    _narrow_rel: dict[str, int] = {}
+    for _e in _narrow_rows:
+        _r = (_e.get("narrow") or {}).get("released")
+        if _r is not None:
+            _narrow_rel[_r] = _narrow_rel.get(_r, 0) + 1
+    _narrow_macros: dict[str, int] = {}
+    for _e in _narrow_rows:
+        _m = (_e.get("narrow") or {}).get("macro")
+        if _m is not None:
+            _narrow_macros[_m] = _narrow_macros.get(_m, 0) + 1
     _second_pairs: dict[str, int] = {}
     for _e in _second_rows:
         _k = f"{_e['second_choice'].get('from')}->{_e['second_choice'].get('to')}"
@@ -1200,6 +1346,19 @@ async def run(args) -> dict:
             "enabled": bool(args.second_choice),
             "n": len(_second_rows),
             "pairs": _second_pairs,
+        },
+        "narrow": {
+            "enabled": bool(args.narrow_commitment),
+            "horizon": NARROW_HORIZON,
+            "narrowed_decisions": len(_narrow_rows),
+            "narrowed_wait_n": _narrow_wait,
+            "narrowed_wait_share": round(_narrow_wait / len(_narrow_rows), 4)
+            if _narrow_rows else 0.0,
+            "releases": _narrow_rel,
+            "macros": _narrow_macros,
+            "macro_exec_counterfactual_note": "macro_execute.* rows carry "
+            "counterfactual F1 tags in narrow mode (record-only); actual "
+            "execution is gate narrow-execute",
         },
         "double_sample": {
             "enabled": bool(args.double_sample),

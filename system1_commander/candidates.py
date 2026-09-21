@@ -556,3 +556,63 @@ def resolve_macro_execution(macro_name: str, snap: Snapshot,
     if not acts:
         return "wait", [], "macro-wait"
     return atomic, acts, "mapped"
+
+
+# ── Jevfix narrowing (备选局独立路径；F1/F2 实现只读复用，不改动) ──
+# minecraft-agent collectionTarget 同构：宏赢票后承诺 horizon 内原子
+# ballot 收敛到 {映射首步, place_ready(如有), wait}，Jev 逐 tick 照投。
+# - 映射首步 = F1 映射表 + F6 demand-proxy（不可造宏→build_weap 进缩票集）；
+#   place-first 体现为 place_ready 准入（同 F1 守卫条件），不做执行覆盖。
+# - B2 退位 / macro-weak 记录由调用方沿用 F1 同款（iron_retired /
+#   MACRO_WEAK_CONF），此处只定 ballot 形状与 horizon 状态机。
+NARROW_HORIZON = 5
+
+
+def narrow_target_for_macro(macro_name: str, snap: Snapshot) -> str:
+    """Narrowing 承诺的原子目标（纯函数，可单测）。
+
+    顺序 = demand-proxy 条件映射 → F1 默认映射表；place-first 不进
+    target（它以 place_ready 成员身份进缩票集）。未知宏 → "wait"。
+    """
+    spec = DEMAND_PROXY_MACROS.get(macro_name)
+    if spec is not None:
+        unit, proxy = spec
+        can = {str(x) for x in (snap.available_production or [])}
+        if unit not in can:
+            return proxy
+    return MACRO_DEFAULT_ATOMIC.get(macro_name, "wait")
+
+
+def build_narrowed_ballot(target_atomic: str, snap: Snapshot,
+                           by_name: dict) -> list[Candidate]:
+    """缩票集成分（纯函数，可单测）：[映射首步, place_ready?, wait]。
+
+    - target 缺席 by_name（如 combat 表错配）→ 退化为 [wait]（+place）。
+    - place_ready 仅 ready_to_place 非空准入（= F1 place-first 守卫条件）。
+    - wait 恒在（空转量尺 narrowed_wait% 的分母锚）。
+    """
+    out: list[Candidate] = []
+    if target_atomic != "wait" and target_atomic in by_name:
+        out.append(by_name[target_atomic])
+    if snap.ready_to_place and "place_ready" in by_name:
+        if not out or out[0].name != "place_ready":
+            out.append(by_name["place_ready"])
+    if "wait" in by_name and not any(c.name == "wait" for c in out):
+        out.append(by_name["wait"])
+    if not out and "wait" in by_name:
+        out.append(by_name["wait"])
+    return out
+
+
+def narrow_next(*, remaining_before: int, landed: bool) -> tuple[int, str | None]:
+    """Horizon 状态机（纯函数，可单测）：返回 (remaining_after, released)。
+
+    - landed（映射首步落地）→ 立即释放（"landed"），剩余 budget 丢弃。
+    - 否则 remaining-1；到 0 → 到期释放（"expired"），否则继续（None）。
+    """
+    if landed:
+        return 0, "landed"
+    after = int(remaining_before) - 1
+    if after <= 0:
+        return 0, "expired"
+    return after, None
