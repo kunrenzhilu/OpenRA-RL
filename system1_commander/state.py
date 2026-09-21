@@ -8,6 +8,7 @@ Chebyshev distance buckets. Output is standard JSON (json.dumps).
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -123,6 +124,39 @@ def _as_list(v):
     return []
 
 
+# Live `production_items` entries carry no queue_type, so unit-vs-structure is
+# inferred from the item name. Mislabels are safe: trained units never sit at
+# 100% awaiting placement, and place_building re-validates readiness
+# server-side (a spurious place just fails the batch).
+_UNIT_QUEUE_ITEMS = COMBAT_UNIT_TYPES | {"e6", "medic", "dog", "harv", "mcv"}
+
+_PROD_ITEM_RE = re.compile(r"^(?P<item>.+?)@(?P<pct>\d+(?:\.\d+)?)%")
+
+
+def _parse_production_items(items) -> list[dict]:
+    """Parse live `production_items` strings ("powr@14%(~155 ticks)") into
+    {queue_type, item, progress} dicts (progress as 0.0-1.0 fraction)."""
+    out = []
+    for s in _as_list(items):
+        if isinstance(s, dict):
+            out.append(s)
+            continue
+        m = _PROD_ITEM_RE.match(str(s))
+        if not m:
+            continue
+        name = m.group("item")
+        try:
+            prog = float(m.group("pct")) / 100.0
+        except (TypeError, ValueError):
+            continue
+        out.append({
+            "queue_type": "Unit" if name in _UNIT_QUEUE_ITEMS else "Building",
+            "item": name,
+            "progress": prog,
+        })
+    return out
+
+
 def build_snapshot(game_state: dict, units: list | None = None, buildings: list | None = None) -> Snapshot:
     """Merge tool outputs into a Snapshot. Missing keys degrade gracefully."""
     gs = game_state or {}
@@ -155,9 +189,15 @@ def build_snapshot(game_state: dict, units: list | None = None, buildings: list 
     snap.enemies = _as_list(gs.get("enemy_summary", []) or gs.get("visible_enemies", []) or [])
     snap.enemy_buildings = _as_list(
         gs.get("enemy_buildings_summary", []) or gs.get("visible_enemy_buildings", []) or [])
-    snap.production = _as_list(
-        gs.get("production", []) or gs.get("production_queues", []) or
-        gs.get("production_items", []) or [])
+    _raw_prod = gs.get("production", [])
+    if isinstance(_raw_prod, list) and any(isinstance(p, dict) for p in _raw_prod):
+        snap.production = [p for p in _raw_prod if isinstance(p, dict)]
+    else:
+        # Live server shape: no `production` key; `production_queues` is an
+        # int count (truthy when busy — never use it as the list) and
+        # `production_items` are "item@NN%(~N ticks)" strings (server:
+        # openra_environment.py get_game_state summary).
+        snap.production = _parse_production_items(gs.get("production_items", []))
     snap.available_production = _as_list(gs.get("available_production", []) or [])
     try:
         snap.explored_percent = float(gs.get("explored_percent", 0.0) or 0.0)
