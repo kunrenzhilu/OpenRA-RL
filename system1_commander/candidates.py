@@ -232,3 +232,113 @@ def make_skip_entry(*, i: int, tick: int, state_kind: str, state_tokens: int,
         "advance_ticks": advance_ticks,
         "advance_interrupted": advance_interrupted,
     }
+
+
+# ── Jev-max J2: macro layer (options framework; plan §2, FULL table) ─────
+# Five macros, copied verbatim from the plan (a macro set WITHOUT fast_weap
+# is disqualified: it cuts the War Factory chain = fix3 harv absence again).
+# Each macro maps onto the existing executor.batch + advance chain as a
+# multi-step script; the builder below returns the FIRST currently-legal
+# step (place-first, then build/train, else [] = wait). Descriptions are
+# the phase-1 "phase-goal manual" (soft-replaces iron rule 2; the iron
+# backup itself stays in backend_jev). Backend-agnostic: plain Candidates.
+MACRO_NAMES = ("open_powr", "rush_barr", "fast_weap", "econ_harv", "armor_push")
+
+
+def _building_in_queue(snap: Snapshot) -> bool:
+    return any(p.get("queue_type") == "Building" for p in (snap.production or []))
+
+
+def _has_placed(snap: Snapshot, btype: str) -> bool:
+    return any(b.get("type") == btype for b in snap.own_buildings)
+
+
+def _macro_open_powr(snap: Snapshot) -> list[dict]:
+    """open_powr: powr opening (baseline) -> build_powr + place on arrival."""
+    if snap.ready_to_place:
+        return _place_ready(snap)
+    if _building_in_queue(snap):
+        return []
+    return [{"tool": "build_structure", "building_type": "powr"}]
+
+
+def _macro_rush_barr(snap: Snapshot) -> list[dict]:
+    """rush_barr: forward Barracks -> build_barr + place + train_e1 x N."""
+    if snap.ready_to_place:
+        return _place_ready(snap)
+    if _building_in_queue(snap):
+        if _has_placed(snap, "barr"):
+            return [{"tool": "build_unit", "unit_type": "e1", "count": 1}]
+        return []
+    if _has_placed(snap, "barr"):
+        return [{"tool": "build_unit", "unit_type": "e1", "count": 1}]
+    return [{"tool": "build_structure", "building_type": "barr"}]
+
+
+def _macro_fast_weap(snap: Snapshot) -> list[dict]:
+    """fast_weap: tech rush -> build_weap + place (SOLE harv/tank prereq)."""
+    if snap.ready_to_place:
+        return _place_ready(snap)
+    if _building_in_queue(snap):
+        return []
+    return [{"tool": "build_structure", "building_type": "weap"}]
+
+
+def _macro_econ_harv(snap: Snapshot) -> list[dict]:
+    """econ_harv: grow income -> train_harv (prefiltered by can_make)."""
+    if "harv" not in {str(x) for x in (snap.available_production or [])}:
+        return []
+    return [{"tool": "build_unit", "unit_type": "harv", "count": 1}]
+
+
+def _macro_armor_push(snap: Snapshot) -> list[dict]:
+    """armor_push: tank army -> train_1tnk x N (prefiltered by can_make)."""
+    if "1tnk" not in {str(x) for x in (snap.available_production or [])}:
+        return []
+    return [{"tool": "build_unit", "unit_type": "1tnk", "count": 1}]
+
+
+def list_macro_candidates() -> list[Candidate]:
+    return [
+        Candidate("open_powr", "eco",
+                  "Opening: secure power first - start a Power Plant, "
+                  "or place the finished building to unblock the queue.",
+                  _macro_open_powr),
+        Candidate("rush_barr", "eco",
+                  "Early pressure: raise Barracks, place it, then train "
+                  "rifle infantry to contest the map.",
+                  _macro_rush_barr),
+        Candidate("fast_weap", "eco",
+                  "Tech rush: raise a War Factory to unlock harvesters "
+                  "and tanks (the only path to vehicle income).",
+                  _macro_fast_weap),
+        Candidate("econ_harv", "eco",
+                  "Economy: train a harvester to grow ore income "
+                  "(only when harvesters are producible).",
+                  _macro_econ_harv),
+        Candidate("armor_push", "eco",
+                  "Armor: mass light tanks for a decisive push "
+                  "(only when tanks are producible).",
+                  _macro_armor_push),
+    ]
+
+
+def list_executable_macros(macros: list[Candidate],
+                           snap: Snapshot) -> list[Candidate]:
+    """Drop macros whose precondition fails this tick.
+
+    Same loop+continue shape as list_executable_candidates: econ_harv
+    needs harv in can_make, armor_push needs 1tnk; the three structural
+    macros always stay (their builders degrade to place/wait steps).
+    """
+    can = {str(x) for x in (snap.available_production or [])}
+    out: list[Candidate] = []
+    for c in macros:
+        if c.name == "econ_harv":
+            if "harv" not in can:
+                continue
+        elif c.name == "armor_push":
+            if "1tnk" not in can:
+                continue
+        out.append(c)
+    return out

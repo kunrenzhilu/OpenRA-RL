@@ -11,7 +11,7 @@ import os
 import time
 
 from system1_commander.backend_base import Prediction, System1Backend
-from system1_commander.candidates import Candidate
+from system1_commander.candidates import MACRO_NAMES, Candidate
 
 JEV_MODEL = "jev-1.13.0"
 INPUT_PRICE_PER_MTOK = 0.042
@@ -63,22 +63,46 @@ class JevBackend(System1Backend):
 
     def _questions(self, candidates: list[Candidate]) -> dict:
         from typesafe_sdk import Choice, Noul, Score
+        names = {c.name for c in candidates}
+        # Jev-max J2: phase-1 macro ballot gets the phase-goal manual
+        # (criteria = macro descriptions, soft-replaces iron rule 2);
+        # the iron backup (place-first, ballot-only) stays below.
+        if names and names <= set(MACRO_NAMES):
+            tactic_instructions = (
+                "Pick the base-wide phase goal for this tick. "
+                "Phase goals: open_powr = secure power first (default "
+                "opening); rush_barr = early Barracks into rifle infantry "
+                "pressure; fast_weap = rush War Factory to unlock "
+                "harvesters and tanks; econ_harv = grow ore income with "
+                "another harvester; armor_push = mass light tanks for a "
+                "decisive push. "
+                "Prefer fast_weap when no vehicle production exists yet; "
+                "prefer econ_harv / armor_push only when the economy can "
+                "support them. "
+                "Iron backup: (1) If \"ready_to_place\" is non-empty or "
+                "\"queue_blocked_by_unplaced\" is true, vote \"open_powr\" "
+                "so the finished building gets placed and the queue "
+                "unblocks. "
+                "(3) Only vote for options on this ballot."
+            )
+        else:
+            tactic_instructions = (
+                "Given the real-time strategy game state, pick the best tactic. "
+                "Iron rules: (1) If \"ready_to_place\" is non-empty or "
+                "\"queue_blocked_by_unplaced\" is true, you MUST vote "
+                "\"place_ready\" - a finished building left in the queue "
+                "blocks all further production. "
+                "(2) If \"harvesters\" is 0 AND \"harv\" is listed in "
+                "\"can_make\", prefer \"train_harv\": no income means "
+                "slow death. Otherwise (harv not producible, e.g. "
+                "conyard-only with empty available_production) vote "
+                "\"build_powr\" to open the queue. "
+                "(3) Only vote for build/train options listed in \"can_make\": "
+                "voting for anything else wastes the decision."
+            )
         return {
             "tactic": Choice(
-                instructions=(
-                    "Given the real-time strategy game state, pick the best tactic. "
-                    "Iron rules: (1) If \"ready_to_place\" is non-empty or "
-                    "\"queue_blocked_by_unplaced\" is true, you MUST vote "
-                    "\"place_ready\" - a finished building left in the queue "
-                    "blocks all further production. "
-                    "(2) If \"harvesters\" is 0 AND \"harv\" is listed in "
-                    "\"can_make\", prefer \"train_harv\": no income means "
-                    "slow death. Otherwise (harv not producible, e.g. "
-                    "conyard-only with empty available_production) vote "
-                    "\"build_powr\" to open the queue. "
-                    "(3) Only vote for build/train options listed in \"can_make\": "
-                    "voting for anything else wastes the decision."
-                ),
+                instructions=tactic_instructions,
                 criteria={c.name: c.description for c in candidates},
             ),
             "risk_under_attack": Noul(

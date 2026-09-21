@@ -99,6 +99,11 @@ def _parse_args(argv=None):
                    help="Plan §7: per-game USD cap. Once hit, remaining "
                         "decisions turn to wait (stop asking, save the game). "
                         "0 disables.")
+    # Jev-max J2: two-phase macro -> atomic (eco decisions only).
+    p.add_argument("--two-phase", action="store_true",
+                   help="J2: phase-1 votes a macro, phase-2 picks the atomic "
+                        "action with macro=<round-1> prefixed to the state. "
+                        "Auto-reverts to single-phase if two-phase p95 > 4s.")
     return p.parse_args(argv)
 
 
@@ -140,6 +145,10 @@ async def run(args) -> dict:
         attach_rich_fields,
         observe_trackers,
         reset_trackers,
+    )
+    from system1_commander.candidates import (  # Jev-max J2 (same reason)
+        list_executable_macros,
+        list_macro_candidates,
     )
 
     os.makedirs(args.log_dir, exist_ok=True)
@@ -184,6 +193,10 @@ async def run(args) -> dict:
     _abl_every = max(1, int(args.ablation_every or 10))
     abl_offset = int(args.ablation_seed or 0) % _abl_every
     cap_hit, cap_hit_i = False, None
+    # Jev-max J2: two-phase serial p95 must stay <= 4s, else revert (§2).
+    two_phase_on = bool(args.two_phase)
+    two_phase_lat: list[float] = []
+    two_phase_disabled_at = None
 
     try:
         async with OpenRAMCPClient(base_url=args.url, message_timeout_s=300.0) as client:
@@ -298,6 +311,7 @@ async def run(args) -> dict:
                     ballot_names: list[str] | None = None
                     is_skip = False
                     abl_entry = None  # Jev-max J1: filled on sampled ticks.
+                    mchoice, macro_entry = None, None  # Jev-max J2.
                     # Plan §7 cost cap: stop asking, save the game. Once hit,
                     # every remaining decision is wait (advance only); the
                     # ablation sampler below also stops (pred is synthetic).
@@ -401,7 +415,35 @@ async def run(args) -> dict:
                                 "wait until state changes")
                             actions = []
                         else:
-                            pred = await asyncio.to_thread(backend.predict, state, use_cands)
+                            # Jev-max J2: phase-1 macro vote (eco only, bypass
+                            # rows never reach here). Advisory: no gate, the
+                            # vote only prefixes phase-2 state + the log.
+                            state2 = state
+                            if two_phase_on and kind == "eco":
+                                _macros = list_executable_macros(
+                                    list_macro_candidates(), snap)
+                                if _macros:
+                                    _mnames = {m.name for m in _macros}
+                                    pred1 = await asyncio.to_thread(
+                                        backend.predict, state, _macros)
+                                    costs.append(pred1.cost_usd)
+                                    mchoice = (pred1.choice
+                                               if pred1.choice in _mnames
+                                               else _macros[0].name)
+                                    state2 = {"macro": mchoice, **state}
+                                    _, _toks2 = state_to_json(
+                                        state2, args.state_budget)
+                                    macro_entry = {
+                                        "choice": mchoice,
+                                        "probs": pred1.probs,
+                                        "confidence": pred1.confidence,
+                                        "latency_ms": round(
+                                            pred1.latency_ms, 1),
+                                        "cost_usd": pred1.cost_usd,
+                                        "ballot": sorted(_mnames),
+                                        "phase2_tokens": _toks2,
+                                    }
+                            pred = await asyncio.to_thread(backend.predict, state2, use_cands)
                             gate = apply_gate(
                                 pred, use_cands, _make_backend("scripted"),
                                 state, gate_cfg,
@@ -409,6 +451,23 @@ async def run(args) -> dict:
                                         if args.backend == "nanojev" else None))
                             actions = (by_name[gate.choice_name].actions(snap)
                                        if gate.choice_name in by_name else [])
+                            if macro_entry is not None:
+                                # Combined wall-clock latency for the decision;
+                                # phase-1 keeps its own numbers in the entry.
+                                pred.latency_ms = (pred.latency_ms or 0.0) + (
+                                    macro_entry["latency_ms"] or 0.0)
+                                two_phase_lat.append(pred.latency_ms)
+                                if len(two_phase_lat) >= 3:
+                                    _p95 = sorted(two_phase_lat)[
+                                        max(0, int(len(two_phase_lat) * 0.95) - 1)]
+                                    if _p95 > 4000.0:
+                                        two_phase_on = False
+                                        two_phase_disabled_at = i
+                                        print(
+                                            "[demo] TWO-PHASE p95 "
+                                            f"{_p95:.0f}ms > 4000ms at d{i}; "
+                                            "reverting to single-phase",
+                                            flush=True)
                             # Jev-max J1 ablation: same-tick poor/rich dual ask.
                             # ALWAYS executes the poor branch (pred/gate/actions
                             # above untouched); the rich branch is record-only.
@@ -479,6 +538,9 @@ async def run(args) -> dict:
                             entry["cap_stop"] = True
                         if abl_entry is not None:
                             entry["ablation"] = abl_entry
+                        if mchoice is not None:
+                            entry["macro"] = mchoice
+                            entry["phase1"] = macro_entry
                         # Laya plan §A2: honest books; batch_ok / gate.mode frozen.
                         if not rec.actions and rec.choice != "wait":
                             entry["noop_alarm"] = True
@@ -533,7 +595,8 @@ async def run(args) -> dict:
                               f"pred={_pstr} gate={gate.mode}:{gate.choice_name} "
                               f"batch_ok={rec.batch_ok} adv={moved}{'!' if interrupted else ''} "
                               f"{_plat:.0f}ms ${_pcost:.6f}"
-                              f"{' fix=' + fix_tag if fix_tag else ''}", flush=True)
+                              f"{' fix=' + fix_tag if fix_tag else ''}"
+                              f"{' macro=' + str(mchoice) if mchoice else ''}", flush=True)
                     if game_done:
                         break
 
@@ -623,6 +686,13 @@ async def run(args) -> dict:
         },
         "cost_cap": {"cap_usd": args.cost_cap, "hit": cap_hit,
                      "hit_at_i": cap_hit_i},
+        "two_phase": {
+            "enabled": bool(args.two_phase),
+            "n": len(two_phase_lat),
+            "disabled_at_i": two_phase_disabled_at,
+            "p95_ms": round(sorted(two_phase_lat)[
+                max(0, int(len(two_phase_lat) * 0.95) - 1)], 1) if two_phase_lat else 0.0,
+        },
         "harvesters_end": snap_end.harvester_count,
         "cash_end": snap_end.cash, "ore_end": snap_end.ore,
         "state_tokens_p50": statistics.median(state_toks) if state_toks else 0,
