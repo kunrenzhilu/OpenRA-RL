@@ -11,7 +11,8 @@ Two transports (chosen at construction):
 
 Driver venv never imports torch: both paths stay in the nanojev venv
 (CUDA) or plain HTTP. ~/Github/laya is used read-only via PYTHONPATH.
-Weights live in /tmp (HF snapshot cache), never in the repo.
+Weights are solidified at `.data/laya-weights-1c5edc1` (HF rev 1c5edc1);
+the legacy /tmp/laya-hf cache no longer exists (WSL reboot wipes /tmp).
 """
 
 from __future__ import annotations
@@ -28,10 +29,25 @@ from system1_commander.backend_base import Prediction, System1Backend
 from system1_commander.candidates import Candidate
 
 DEFAULT_PYTHON_BIN = "/tmp/nanojev-venv/bin/python"
-DEFAULT_PREDICT_SCRIPT = str(Path(__file__).resolve().parent / "laya_predict.py")
+DEFAULT_PREDICT_SCRIPT = str(
+    Path(__file__).resolve().parent.parent / "scripts" / "laya_predict.py")
 DEFAULT_LAYA_REPO = str(Path.home() / "Github" / "laya")
 SUBPROCESS_TIMEOUT_S = 600.0
 HTTP_TIMEOUT_S = 120.0
+
+
+def _default_model_dir() -> str | None:
+    """Solidified Laya weights for the subprocess path (server path owns
+    its weights via serve_laya argv). Worktree `.data/` first, then the
+    main checkout's `.data/`."""
+    cands = [
+        Path(__file__).resolve().parent.parent / ".data" / "laya-weights-1c5edc1",
+        Path.home() / "Github" / "openra-commander" / ".data" / "laya-weights-1c5edc1",
+    ]
+    for p in cands:
+        if (p / "model.safetensors").exists() or (p / "rl_agent_config.json").exists():
+            return str(p)
+    return None
 
 
 def _resolve(name: str, explicit: str | None, default: str) -> str:
@@ -81,6 +97,9 @@ class LayaBackend(System1Backend):
             env["PYTHONPATH"] = DEFAULT_LAYA_REPO + (
                 ":" + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
             cmd = [self.python_bin, self.predict_script, "--input", str(req_path)]
+            model_dir = env.get("LAYA_MODEL_DIR") or _default_model_dir()
+            if model_dir and Path(model_dir).exists():
+                cmd += ["--model-dir", model_dir]
             try:
                 proc = subprocess.run(cmd, capture_output=True, text=True,
                                       timeout=self.timeout_s, env=env)

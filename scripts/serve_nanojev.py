@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -71,12 +72,22 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> int:
     global ENGINE
     p = argparse.ArgumentParser(description="Resident NanoJev server.")
-    p.add_argument("--checkpoint-dir", default="/tmp/NanoJev-unified")
+    p.add_argument("--checkpoint-dir", default=None,
+                   help="Default: solidified .data/nanojev-unified-047b927 "
+                        "(worktree, else main checkout), else /tmp/NanoJev-unified.")
     p.add_argument("--port", type=int, default=8932)
     p.add_argument("--precision", choices=["fp32", "bf16"], default="bf16")
     p.add_argument("--predict-script-dir",
                    default=str(Path.home() / "Github" / "NanoJev" / "scripts"))
     a = p.parse_args()
+    if not a.checkpoint_dir:
+        a.checkpoint_dir = os.environ.get("NANOJEV_CHECKPOINT_DIR") or next(
+            (str(p) for p in (
+                Path(__file__).resolve().parent.parent / ".data" / "nanojev-unified-047b927",
+                Path.home() / "Github" / "openra-commander" / ".data" / "nanojev-unified-047b927",
+            ) if (p / "best.safetensors").exists()),
+            "/tmp/NanoJev-unified",
+        )
 
     sys.path.insert(0, a.predict_script_dir)
     from predict_toy_decisions import DecisionPredictor  # noqa: E402

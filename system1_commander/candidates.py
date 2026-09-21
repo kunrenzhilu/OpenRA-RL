@@ -90,8 +90,7 @@ def _hold_position(snap: Snapshot) -> list[dict]:
     return _combat_or_empty([{"tool": "stop_units", "unit_ids": "all_combat"}])
 
 
-def list_combat_candidates() -> list[Candidate]:
-    return [
+def list_combat_candidates() -> list[Candidate]:    return [
         Candidate("attack_nearest", "combat",
                   "Order all combat units to attack the enemy closest to our base.",
                   _attack_nearest),
@@ -162,3 +161,74 @@ def list_eco_candidates() -> list[Candidate]:
                   "Issue no order and let production and construction progress.",
                   lambda snap: []),
     ]
+
+
+# ── A-track (Laya plan §A1): executable prefilter + skip schema ─────────
+# Predicates are same-source as the builders' `[]` conditions above; no new
+# semantics are invented here. `wait` / `deploy_mcv` are never filtered.
+
+def exec_flags(snap: Snapshot) -> dict:
+    """Predicate-input snapshot for judge recount (Laya plan A1/A3).
+
+    `queue_nonempty` is the `place_ready` predicate input (ready-to-place
+    queue non-empty), so the judge can recount the ballot with the
+    `candidates.py` predicates without trusting the executor's report.
+    """
+    return {
+        "queue_nonempty": bool(snap.ready_to_place),
+        "own_combat": _own_combat(snap),
+        "nearest_enemy": snap.nearest_enemy is not None,
+        "weakest_enemy": snap.weakest_enemy is not None,
+        "weak_own": bool(snap.weak_own_ids),
+    }
+
+
+def list_executable_candidates(candidates: list[Candidate],
+                               snap: Snapshot) -> list[Candidate]:
+    """Drop candidates whose builder would return `[]` for this snapshot."""
+    flags = exec_flags(snap)
+    out: list[Candidate] = []
+    for c in candidates:
+        if c.kind == "eco" and c.name == "place_ready":
+            if not flags["queue_nonempty"]:
+                continue
+        elif c.kind == "combat":
+            if c.name == "attack_nearest":
+                if not (flags["own_combat"] and flags["nearest_enemy"]):
+                    continue
+            elif c.name == "focus_weakest":
+                if not (flags["own_combat"] and flags["weakest_enemy"]):
+                    continue
+            elif c.name in ("guard_choke", "all_combat_attack_move",
+                            "hold_position"):
+                if not flags["own_combat"]:
+                    continue
+            elif c.name == "pull_back_weak":
+                if not flags["weak_own"]:
+                    continue
+        out.append(c)
+    return out
+
+
+def make_skip_entry(*, i: int, tick: int, state_kind: str, state_tokens: int,
+                    flags: dict, advance_ticks: int = 0,
+                    advance_interrupted: bool = False) -> dict:
+    """Schema-frozen skip entry (Laya plan A1): empty ballot after prefilter.
+
+    No `prediction`/`confidence`/`probs` keys by design; `gate.mode` is the
+    fixed `skip-empty-ballot` value outside the execute/downgrade/fallback
+    domain so bench aggregation must list it separately.
+    """
+    return {
+        "kind": "skip",
+        "i": i,
+        "tick": tick,
+        "state_kind": state_kind,
+        "state_tokens": state_tokens,
+        "ballot": [],
+        "exec_flags": dict(flags),
+        "gate": {"mode": "skip-empty-ballot", "choice": "none",
+                 "reason": "ballot empty after prefilter"},
+        "advance_ticks": advance_ticks,
+        "advance_interrupted": advance_interrupted,
+    }

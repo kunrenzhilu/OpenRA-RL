@@ -27,6 +27,11 @@ import time
 from datetime import datetime, timezone
 
 
+# NanoJev plan §A3: same-kind consecutive FAILED (incl. empty packets)
+# reaching K forces `wait` until the state materially changes.
+STREAK_ALARM_K = 5
+
+
 def _parse_args(argv=None):
     p = argparse.ArgumentParser(description="System1 commander demo loop (P0).")
     p.add_argument("--backend", choices=["scripted", "jev", "nanojev", "laya"], default="scripted")
@@ -71,8 +76,11 @@ async def run(args) -> dict:
         build_eco_state,
         build_snapshot,
         estimate_tokens,
+        exec_flags,
         list_combat_candidates,
         list_eco_candidates,
+        list_executable_candidates,
+        make_skip_entry,
         state_to_json,
     )
     from system1_commander.executor import Executor
@@ -107,6 +115,12 @@ async def run(args) -> dict:
     gate_modes, kinds_used = [], []
     # FIX-#1 breaker: consecutive bypass-place failures; >=3 disables #1 for the game.
     fix1_disabled, fix1_consec_fails = False, 0
+    # A-track (NanoJev plan §A1/A3): per-game failure memory + losing
+    # streaks. banned (failed_set) never clears within a game; streak
+    # resets on material state change or success. Jev #1/#2/breaker above untouched.
+    failed_set: set[str] = set()
+    streak: dict[str, int] = {}
+    last_sig: dict[str, tuple] = {}
     game_done, game_result, surrendered = False, "", False
     error_note = ""
     n_buildings_0, mil0 = 0, (0, 0, 0, 0, 0)
@@ -220,6 +234,9 @@ async def run(args) -> dict:
                     # FIX-#1: ready_to_place non-empty hard-cut to place_ready
                     # (eco only, builder double-checked, skips predict).
                     fix_tag = None
+                    # A-track row state (defaults for fix-bypass rows).
+                    ballot_names: list[str] | None = None
+                    is_skip = False
                     if kind == "eco" and not fix1_disabled and snap.ready_to_place:
                         _place_actions = by_name["place_ready"].actions(snap)
                         if _place_actions:
@@ -260,27 +277,113 @@ async def run(args) -> dict:
                             )
                             actions = by_name["wait"].actions(snap)
                     if fix_tag is None:
-                        pred = await asyncio.to_thread(backend.predict, state, candidates)
-                        gate = apply_gate(pred, candidates, _make_backend("scripted"), state, gate_cfg)
-                        actions = by_name[gate.choice_name].actions(snap)
-                    latencies.append(pred.latency_ms)
-                    costs.append(pred.cost_usd)
-                    fix_flags.append(fix_tag is not None)
-                    gate_modes.append(gate.mode)
-                    kinds_used.append(kind)
-                    rec = await ex.execute(gate.choice_name, actions, snap.tick, guard_actions)
-                    moved, interrupted = await ex.advance(args.ticks_per_decision)
-                    rec.advance_ticks = moved
-                    rec.advance_interrupted = interrupted
-                    entry = {
-                        "kind": "decision", "i": i, "tick": snap.tick,
-                        "state_kind": kind,
-                        "state_tokens": toks,
-                        "prediction": pred.to_dict(), "gate": gate.to_dict(),
-                        **rec.to_dict(),
-                    }
-                    if fix_tag is not None:
-                        entry["fix_bypass"] = fix_tag
+                        # A-track wiring (additive; Jev #1/#2/breaker above untouched).
+                        flags = exec_flags(snap)
+                        use_cands = candidates
+                        if args.backend == "laya":
+                            # Laya plan §A1: prefilter; empty ballot -> skip entry.
+                            use_cands = list_executable_candidates(candidates, snap)
+                            ballot_names = [c.name for c in use_cands]
+                        if args.backend == "nanojev":
+                            # NanoJev plan §A3: streak resets on material
+                            # state change (banned never clears: same
+                            # preconditions => same failure).
+                            sig = (snap.cash, len(snap.own_buildings),
+                                   tuple(snap.ready_to_place))
+                            if (last_sig.get(kind) is not None
+                                    and last_sig.get(kind) != sig):
+                                streak[kind] = 0
+                            last_sig[kind] = sig
+                        laya_empty = args.backend == "laya" and len(use_cands) == 0
+                        laya_wait_only = (args.backend == "laya"
+                                          and len(use_cands) == 1
+                                          and use_cands[0].name == "wait")
+                        nano_force_wait = (args.backend == "nanojev"
+                                           and streak.get(kind, 0) >= STREAK_ALARM_K)
+                        pred = None
+                        is_skip = laya_empty
+                        if is_skip:
+                            gate = None
+                            actions = []
+                        elif laya_wait_only:
+                            # Laya plan §A1: ballot is [wait]; skip Laya call.
+                            gate = GateDecision(
+                                "downgrade", "wait",
+                                "prefilter wait-only, skipped Laya call")
+                            actions = []
+                        elif nano_force_wait:
+                            # NanoJev plan §A3: save RTT, wait for state change.
+                            gate = GateDecision(
+                                "fallback", "wait",
+                                f"losing streak>={STREAK_ALARM_K}, "
+                                "wait until state changes")
+                            actions = []
+                        else:
+                            pred = await asyncio.to_thread(backend.predict, state, use_cands)
+                            gate = apply_gate(
+                                pred, use_cands, _make_backend("scripted"),
+                                state, gate_cfg,
+                                banned=(failed_set
+                                        if args.backend == "nanojev" else None))
+                            actions = (by_name[gate.choice_name].actions(snap)
+                                       if gate.choice_name in by_name else [])
+                    if is_skip:
+                        moved, interrupted = await ex.advance(args.ticks_per_decision)
+                        entry = make_skip_entry(
+                            i=i, tick=snap.tick, state_kind=kind,
+                            state_tokens=toks, flags=flags,
+                            advance_ticks=moved,
+                            advance_interrupted=interrupted)
+                        latencies.append(0.0)
+                        costs.append(0.0)
+                        fix_flags.append(True)  # no inference, like fix-bypass
+                        gate_modes.append("skip-empty-ballot")
+                        kinds_used.append(kind)
+                    else:
+                        latencies.append(pred.latency_ms if pred is not None else 0.0)
+                        costs.append(pred.cost_usd if pred is not None else 0.0)
+                        fix_flags.append(fix_tag is not None or pred is None)
+                        gate_modes.append(gate.mode)
+                        kinds_used.append(kind)
+                        rec = await ex.execute(gate.choice_name, actions, snap.tick, guard_actions)
+                        moved, interrupted = await ex.advance(args.ticks_per_decision)
+                        rec.advance_ticks = moved
+                        rec.advance_interrupted = interrupted
+                        entry = {
+                            "kind": "decision", "i": i, "tick": snap.tick,
+                            "state_kind": kind,
+                            "state_tokens": toks,
+                            "gate": gate.to_dict(),
+                            **rec.to_dict(),
+                        }
+                        if pred is not None:
+                            entry["prediction"] = pred.to_dict()
+                        if ballot_names is not None:
+                            entry["ballot"] = ballot_names
+                            entry["exec_flags"] = flags
+                        if fix_tag is not None:
+                            entry["fix_bypass"] = fix_tag
+                        # Laya plan §A2: honest books; batch_ok / gate.mode frozen.
+                        if not rec.actions and rec.choice != "wait":
+                            entry["noop_alarm"] = True
+                            entry["gate"]["alarm"] = "empty-execute"
+                            entry["batch_note"] = f"noop ALARM: {rec.choice} empty"
+                        # NanoJev plan §A1/A3: per-game failure memory + streak.
+                        if args.backend == "nanojev":
+                            failed = (not rec.batch_ok) or (
+                                not rec.actions and rec.choice != "wait")
+                            if failed:
+                                failed_set.add(rec.choice)
+                                streak[kind] = streak.get(kind, 0) + 1
+                                if streak[kind] == STREAK_ALARM_K:
+                                    f_orders.write(json.dumps({
+                                        "kind": "alarm", "i": i,
+                                        "tick": snap.tick, "state_kind": kind,
+                                        "streak": STREAK_ALARM_K,
+                                        "banned": sorted(failed_set),
+                                    }) + "\n")
+                            else:
+                                streak[kind] = 0
                     # FIX-#1 breaker: a bypass place that changes nothing on
                     # the map (online signal) counts a consecutive failure;
                     # success resets. Only #1-issued places count.
@@ -301,11 +404,20 @@ async def run(args) -> dict:
                     f_orders.write(json.dumps(entry) + "\n")
                     f_orders.flush()
                     decisions_log.append(entry)
-                    print(f"[demo] d{i}: tick={snap.tick} [{kind}] toks={toks} "
-                          f"pred={pred.choice}@{pred.confidence:.2f} gate={gate.mode}:{gate.choice_name} "
-                          f"batch_ok={rec.batch_ok} adv={moved}{'!' if interrupted else ''} "
-                          f"{pred.latency_ms:.0f}ms ${pred.cost_usd:.6f}"
-                          f"{' fix=' + fix_tag if fix_tag else ''}", flush=True)
+                    if is_skip:
+                        print(f"[demo] d{i}: tick={snap.tick} [{kind}] toks={toks} "
+                              f"skip-empty-ballot adv={moved}{'!' if interrupted else ''}",
+                              flush=True)
+                    else:
+                        _pstr = (f"{pred.choice}@{pred.confidence:.2f}"
+                                 if pred is not None else "none")
+                        _plat = pred.latency_ms if pred is not None else 0.0
+                        _pcost = pred.cost_usd if pred is not None else 0.0
+                        print(f"[demo] d{i}: tick={snap.tick} [{kind}] toks={toks} "
+                              f"pred={_pstr} gate={gate.mode}:{gate.choice_name} "
+                              f"batch_ok={rec.batch_ok} adv={moved}{'!' if interrupted else ''} "
+                              f"{_plat:.0f}ms ${_pcost:.6f}"
+                              f"{' fix=' + fix_tag if fix_tag else ''}", flush=True)
                     if game_done:
                         break
 
@@ -343,6 +455,13 @@ async def run(args) -> dict:
     _lat_real = [v for v, f in zip(latencies, fix_flags) if not f] or [0.0]
     _fix1_n = sum(1 for e in decisions_log if e.get("fix_bypass") == "#1")
     _fix2_n = sum(1 for e in decisions_log if e.get("fix_bypass") == "#2")
+    # A-track honest books: FAILED totals are reported, never hidden.
+    # (skip entries carry no batch_ok and are excluded by the default.)
+    _failed_by_choice: dict[str, int] = {}
+    for _e in decisions_log:
+        if _e.get("kind") == "decision" and not _e.get("batch_ok", True):
+            _c = str(_e.get("choice", "?"))
+            _failed_by_choice[_c] = _failed_by_choice.get(_c, 0) + 1
     bench = {
         "backend": args.backend,
         "map": snap_end.map_name,
@@ -357,6 +476,7 @@ async def run(args) -> dict:
                       f"downgrade band [{gate_cfg.low},{gate_cfg.high}); else scripted fallback "
                       f"(destructive needs conf>= {gate_cfg.destructive_min})"),
         "gate_modes": {m: gate_modes.count(m) for m in set(gate_modes)},
+        "failed_by_choice": _failed_by_choice,
         "ticks_total": snap_end.tick,
         "wall_s": round(wall_s, 1),
         "buildings_before": n_buildings_0, "buildings_after": len(snap_end.own_buildings),

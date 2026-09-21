@@ -35,6 +35,23 @@ from system1_commander.backend_base import Prediction, System1Backend
 from system1_commander.candidates import Candidate
 
 DEFAULT_CHECKPOINT_DIR = "/tmp/NanoJev-unified"
+"""Legacy default (subprocess path only); import-time resolution below
+prefers the solidified `.data/nanojev-unified-047b927` when present.
+Resident-server mode (NANOJEV_URL) owns its weights and skips this."""
+
+
+def _default_checkpoint_dir() -> str:
+    cands = [
+        Path(__file__).resolve().parent.parent / ".data" / "nanojev-unified-047b927",
+        Path.home() / "Github" / "openra-commander" / ".data" / "nanojev-unified-047b927",
+    ]
+    for p in cands:
+        if (p / "best.safetensors").exists():
+            return str(p)
+    return DEFAULT_CHECKPOINT_DIR
+
+
+DEFAULT_CHECKPOINT_DIR = _default_checkpoint_dir()
 DEFAULT_PYTHON_BIN = "/tmp/nanojev-venv/bin/python"
 DEFAULT_PREDICT_SCRIPT = (
     Path.home() / "Github" / "NanoJev" / "scripts" / "predict_toy_decisions.py"

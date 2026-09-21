@@ -7,7 +7,8 @@ workspace/openra/plan/openra-taskC-system1-commander-plan-20260920.md.
 
 from system1_commander.backend_base import Prediction, System1Backend
 from system1_commander.candidates import Candidate, list_combat_candidates, list_eco_candidates
-from system1_commander.gate import GateConfig, GateDecision, apply_gate
+from system1_commander.candidates import exec_flags, list_executable_candidates, make_skip_entry
+from system1_commander.gate import GateConfig, GateDecision, apply_gate, predict_with_ban
 from system1_commander.state import (
     build_combat_state,
     build_eco_state,
@@ -25,6 +26,10 @@ __all__ = [
     "GateConfig",
     "GateDecision",
     "apply_gate",
+    "predict_with_ban",
+    "exec_flags",
+    "list_executable_candidates",
+    "make_skip_entry",
     "build_combat_state",
     "build_eco_state",
     "build_snapshot",

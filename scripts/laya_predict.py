@@ -19,8 +19,25 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 DEFAULT_MODEL_DIR = os.environ.get("LAYA_MODEL_DIR", "/tmp/laya-weights")
+
+
+def _solidified_dir() -> str | None:
+    """Solidified weights (WSL reboot wipes /tmp; `.data/` survives).
+
+    Checked after $LAYA_MODEL_DIR: worktree `.data/` first, then the main
+    checkout's `.data/` (worktrees share nothing on disk).
+    """
+    cands = [
+        Path(__file__).resolve().parent.parent / ".data" / "laya-weights-1c5edc1",
+        Path.home() / "Github" / "openra-commander" / ".data" / "laya-weights-1c5edc1",
+    ]
+    for p in cands:
+        if (p / "model.safetensors").exists() or (p / "rl_agent_config.json").exists():
+            return str(p)
+    return None
 
 
 def _resolve_model_dir(explicit: str | None) -> str:
@@ -29,6 +46,9 @@ def _resolve_model_dir(explicit: str | None) -> str:
     env = os.environ.get("LAYA_MODEL_DIR")
     if env:
         return env
+    solid = _solidified_dir()
+    if solid:
+        return solid
     # Fall back to the HF snapshot cache layout (snapshot_download target).
     cache_root = os.environ.get("LAYA_HF_CACHE", "/tmp/laya-hf")
     models_root = os.path.join(cache_root, "models--convaiinnovations--laya", "snapshots")

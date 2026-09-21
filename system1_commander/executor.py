@@ -108,15 +108,17 @@ class Executor:
         rec = ExecRecord(tick=tick, choice=choice_name, actions=actions)
         ok, note = await self.batch(actions)
         rec.batch_ok, rec.batch_note = ok, note
-        if not ok:
-            rec.retried = True
-            ok2, note2 = await self.batch(actions)
-            rec.batch_ok, rec.batch_note = ok2, f"retry: {note2}"
-            if not ok2 and guard_actions:
-                ok3, note3 = await self.batch(guard_actions)
-                rec.batch_ok = ok3
-                rec.batch_note = f"guard fallback: {note3}"
-                rec.fell_back_to_guard = True
+        # NanoJev plan A3: same-action retry deleted (a second identical
+        # batch after FAILED can never succeed and wastes 1 RTT; it caused
+        # half the 130 identical deaths). Any retry must come from the
+        # caller with a swapped action via a new execute() call. `retried`
+        # stays in the schema (always False) for bench compatibility.
+        # Guard re-dispatch below is a *different* action, so it stays.
+        if not ok and guard_actions:
+            ok3, note3 = await self.batch(guard_actions)
+            rec.batch_ok = ok3
+            rec.batch_note = f"guard fallback: {note3}"
+            rec.fell_back_to_guard = True
         return rec
 
     async def ensure_deployed(self, snap) -> ExecRecord | None:
