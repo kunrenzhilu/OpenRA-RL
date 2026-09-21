@@ -95,6 +95,44 @@ _AGGRESSIVE_TACTICS = ("attack_nearest", "all_combat_attack_move")
 _DEFENSIVE_FALLBACKS = ("guard_choke", "hold_position")
 
 
+def bearing8(dx: int, dy: int) -> str:
+    """Coarse compass bucket (screen coords, y grows south).
+
+    Mirrors state._dir8 without importing the private: E/W dominate when
+    |dx| >= 2|dy|, N/S when |dy| >= 2|dx|, else diagonals; (0,0) = here.
+    """
+    if dx == 0 and dy == 0:
+        return "here"
+    ax, ay = abs(dx), abs(dy)
+    if ax >= 2 * ay:
+        return "E" if dx > 0 else "W"
+    if ay >= 2 * ax:
+        return "S" if dy > 0 else "N"
+    if dx > 0:
+        return "SE" if dy > 0 else "NE"
+    return "SW" if dy > 0 else "NW"
+
+
+def attach_enemy_bearing(state: dict, snap) -> dict:
+    """Jevfix F3: enemy-centroid bearing/dist buckets onto an eco state.
+
+    Pure; reuses the snapshot the J1 enemy_history feeds on (zero new
+    Snapshot fields). "none" when no enemies are visible.
+    """
+    out = dict(state)
+    if getattr(snap, "enemies", None):
+        bx, by = snap.base_cell
+        cx, cy = snap.enemy_centroid
+        out["enemy_dir"] = bearing8(cx - bx, cy - by)
+        out["enemy_dist"] = (
+            "in_range" if max(abs(cx - bx), abs(cy - by)) <= 8
+            else ("close" if max(abs(cx - bx), abs(cy - by)) <= 25 else "far"))
+    else:
+        out["enemy_dir"] = "none"
+        out["enemy_dist"] = "none"
+    return out
+
+
 def jev_goal_route(*, gate_mode: str, gate_choice: str,
                    ballot_names: list[str],
                    fanout: dict | None) -> tuple[str | None, str]:
@@ -219,6 +257,24 @@ def _parse_args(argv=None):
                    help="J2: phase-1 votes a macro, phase-2 picks the atomic "
                         "action with macro=<round-1> prefixed to the state. "
                         "Auto-reverts to single-phase if two-phase p95 > 4s.")
+    # Jevfix F4D: double-sample diagnosis (record-only, never executes).
+    p.add_argument("--double-sample", action="store_true",
+                   help="Jevfix F4D: on sampled ticks ask the backend twice "
+                        "with the same state+ballot and record agreement "
+                        "(choice2/agree/kl). Diagnostic only.")
+    p.add_argument("--double-sample-every", type=int, default=10,
+                   help="Jevfix F4D: sample 1 tick per N decisions.")
+    # Jevfix F4E: second-choice execution via predict_with_ban.
+    p.add_argument("--second-choice", action="store_true",
+                   help="Jevfix F4E: when the resolved actions are [] and the "
+                        "choice is not wait, fall through to the next choice "
+                        "via gate.predict_with_ban (same function as the "
+                        "fallback path) and execute it tagged second-choice.")
+    # Jevfix F5: combat macros in two-phase combat decisions.
+    p.add_argument("--combat-macros", action="store_true",
+                   help="Jevfix F5: two-phase combat decisions vote a combat "
+                        "macro (defend_hold/probe_attack/all_in_commit) then "
+                        "map onto atomic verbs. Needs --two-phase.")
     # Jev-max J3: goal routing (execute/fallback only, downgrade discarded).
     p.add_argument("--goal-route", action="store_true",
                    help="J3: route on the fan-out goal Choice (downgrade "
@@ -275,8 +331,15 @@ async def run(args) -> dict:
         reset_trackers,
     )
     from system1_commander.candidates import (  # Jev-max J2 (same reason)
-        list_executable_macros,
+        COMBAT_MACRO_DEFAULT_ATOMIC,
+        COMBAT_MACRO_NAMES,
+        MACRO_DEFAULT_ATOMIC,
+        MACRO_WEAK_CONF,
+        RULE1_PLACE_NAMES,
+        iron_retired,
+        list_combat_macros,
         list_macro_candidates,
+        resolve_macro_execution,
     )
 
     os.makedirs(args.log_dir, exist_ok=True)
@@ -293,6 +356,9 @@ async def run(args) -> dict:
             raise ValueError(f"--mix/--state kind must be combat|eco, got {k!r}")
     pools = {"combat": list_combat_candidates(), "eco": list_eco_candidates()}
     builders = {"combat": build_combat_state, "eco": build_eco_state}
+    # Jevfix F1/F5: macro pools (phase-1 ballots; execution maps to atomics).
+    eco_macros = list_macro_candidates()
+    combat_macros = list_combat_macros()
     gate_cfg = GateConfig()
     if args.play_to_end:
         decision_cap = args.max_ticks // max(1, args.ticks_per_decision) + 20
@@ -301,14 +367,12 @@ async def run(args) -> dict:
 
     t_start = time.monotonic()
     latencies, costs, state_toks = [], [], []
-    fix_flags = []  # parallel to latencies/costs: True when row bypassed predict (#1/#2)
+    fix_flags = []  # parallel to latencies/costs: True when row bypassed predict (#2)
     decisions_log = []
     gate_modes, kinds_used = [], []
-    # FIX-#1 breaker: consecutive bypass-place failures; >=3 disables #1 for the game.
-    fix1_disabled, fix1_consec_fails = False, 0
     # A-track (NanoJev plan §A1/A3): per-game failure memory + losing
     # streaks. banned (failed_set) never clears within a game; streak
-    # resets on material state change or success. Jev #1/#2/breaker above untouched.
+    # resets on material state change or success. Jev FIX-#2 above untouched.
     failed_set: set[str] = set()
     streak: dict[str, int] = {}
     last_sig: dict[str, tuple] = {}
@@ -321,10 +385,16 @@ async def run(args) -> dict:
     _abl_every = max(1, int(args.ablation_every or 10))
     abl_offset = int(args.ablation_seed or 0) % _abl_every
     cap_hit, cap_hit_i = False, None
-    # Jev-max J2: two-phase serial p95 must stay <= 4s, else revert (§2).
+    # Jevfix F1/F5: two-phase serial p95 must stay <= 4s, else the game
+    # STOPS (no mid-game revert to single-phase: one game, one regime).
     two_phase_on = bool(args.two_phase)
     two_phase_lat: list[float] = []
     two_phase_disabled_at = None
+    two_phase_stop_note = ""
+    cost_phase1_usd = 0.0
+    cost_phase2_usd = 0.0  # mapped execution issues no phase-2 call
+    spawn_base_cell: list | None = None
+    stop_after_decision = False
 
     try:
         async with OpenRAMCPClient(base_url=args.url, message_timeout_s=300.0) as client:
@@ -428,23 +498,43 @@ async def run(args) -> dict:
                     candidates = pools[kind]
                     by_name = {c.name: c for c in candidates}
                     observe_trackers(snap)  # Jev-max J1: feed enemy/traj memory.
+                    if spawn_base_cell is None and tuple(snap.base_cell) != (0, 0):
+                        spawn_base_cell = list(snap.base_cell)
                     state = builders[kind](snap)
                     if args.memory:  # Jev-max J4: history on the poor state.
                         _mem_rows = [e for e in decisions_log
                                      if e.get("kind") == "decision"]
                         state = attach_history(
                             state, summarize_trajectory(_mem_rows))
+                    if kind == "eco":
+                        # Jevfix F3: enemy bearing so place direction is
+                        # votable with information (pure, zero new fields).
+                        state = attach_enemy_bearing(state, snap)
                     state_json, toks = state_to_json(state, args.state_budget)
                     state_toks.append(toks)
                     guard_actions = by_name["guard_choke"].actions(snap) if "guard_choke" in by_name else None
-                    # FIX-#1: ready_to_place non-empty hard-cut to place_ready
-                    # (eco only, builder double-checked, skips predict).
+                    # Jevfix: two-phase routing. macro_mode (eco) and
+                    # combat_macro_mode (combat, needs --combat-macros) run
+                    # the F1 mapped execution (FIX-#1/#2 retire there: rule
+                    # 2/3 per the B2 table, rule 1 via the place-first guard
+                    # inside resolve_macro_execution).
+                    macro_mode = two_phase_on and kind == "eco"
+                    combat_macro_mode = (two_phase_on and bool(args.combat_macros)
+                                         and kind == "combat")
+                    macro_taken = False
                     fix_tag = None
                     # A-track row state (defaults for fix-bypass rows).
                     ballot_names: list[str] | None = None
+                    flags = exec_flags(snap)
                     is_skip = False
                     abl_entry = None  # Jev-max J1: filled on sampled ticks.
-                    mchoice, macro_entry = None, None  # Jev-max J2.
+                    mchoice, macro_entry = None, None  # Jev-max J2 / Jevfix F1.
+                    macro_exec = None  # Jevfix F1: mapped-execution record.
+                    exec_tag = None  # Jevfix F1: place-first/demand-proxy/...
+                    second_rec = None  # Jevfix F4E: second-choice record.
+                    ds_rec = None  # Jevfix F4D: double-sample record.
+                    ds_state, ds_ballot = None, None  # double-sample inputs.
+                    ban_extra: set = set()  # extra bans for second-choice.
                     fanout_rec, route_note = None, None  # Jev-max J3.
                     discard_reason = None  # Jev-max J1: why a vote was discarded.
                     # Plan §7 cost cap: stop asking, save the game. Once hit,
@@ -468,28 +558,106 @@ async def run(args) -> dict:
                             f"COST-CAP ${args.cost_cap:.2f}: stop asking, save game",
                         )
                         actions = []
-                    elif kind == "eco" and not fix1_disabled and snap.ready_to_place:
-                        _place_actions = by_name["place_ready"].actions(snap)
-                        if _place_actions:
-                            fix_tag = "#1"
-                            pred = Prediction(
-                                choice="place_ready", probs={"place_ready": 1.0},
-                                confidence=1.0, latency_ms=0.0, cost_usd=0.0,
-                                backend="fix-bypass",
-                                detail={"skipped_predict": True},
-                            )
-                            gate = GateDecision(
-                                "execute", "place_ready",
-                                f"FIX-#1 hard-cut: ready_to_place={snap.ready_to_place}",
-                            )
-                            actions = _place_actions
+                    elif macro_mode or combat_macro_mode:
+                        # Jevfix F1/F5/F6: phase-1 macro vote, phase-2 mapped
+                        # execution. NEVER re-votes: illegal/empty mappings
+                        # fall through to wait inside resolve_*.
+                        macro_taken = True
+                        _macros = eco_macros if macro_mode else combat_macros
+                        _amap = (MACRO_DEFAULT_ATOMIC if macro_mode
+                                 else COMBAT_MACRO_DEFAULT_ATOMIC)
+                        ballot_names = [m.name for m in _macros]
+                        pred1 = await asyncio.to_thread(
+                            backend.predict, state, _macros)
+                        cost_phase1_usd += pred1.cost_usd
+                        _mnames = {m.name for m in _macros}
+                        mchoice = (pred1.choice if pred1.choice in _mnames
+                                   else _macros[0].name)
+                        macro_entry = {
+                            "choice": mchoice,
+                            "probs": pred1.probs,
+                            "confidence": pred1.confidence,
+                            "latency_ms": round(pred1.latency_ms, 1),
+                            "cost_usd": pred1.cost_usd,
+                            "ballot": sorted(_mnames),
+                        }
+                        two_phase_lat.append(pred1.latency_ms or 0.0)
+                        if len(two_phase_lat) >= 3:
+                            _p95 = sorted(two_phase_lat)[
+                                max(0, int(len(two_phase_lat) * 0.95) - 1)]
+                            if _p95 > 4000.0:
+                                two_phase_disabled_at = i
+                                two_phase_stop_note = (
+                                    f"TWO-PHASE p95 {_p95:.0f}ms > 4000ms "
+                                    f"at d{i}; stopping (single-regime rule: "
+                                    "no mid-game revert, rerun single-phase)")
+                                stop_after_decision = True
+                                print(f"[demo] {two_phase_stop_note}",
+                                      flush=True)
+                        atomic, actions, exec_tag = resolve_macro_execution(
+                            mchoice, snap, by_name, _amap)
+                        weak = bool((pred1.confidence or 0.0) < MACRO_WEAK_CONF)
+                        macro_exec = {
+                            "macro": mchoice,
+                            "atomic": atomic,
+                            "tag": exec_tag,
+                            "weak": weak,
+                            "iron_retired": iron_retired(
+                                two_phase_on=True, kind=kind, phase2=True),
+                        }
+                        if exec_tag in ("macro-wait", "macro-illegal-wait"):
+                            actions = []
+                            ban_extra = {atomic}
+                        gate = GateDecision(
+                            "macro-execute",
+                            atomic if exec_tag not in (
+                                "macro-wait", "macro-illegal-wait") else "wait",
+                            f"macro {mchoice}->{atomic} {exec_tag}"
+                            + (" [macro-weak]" if weak else ""),
+                        )
+                        pred = pred1
+                        # Jev-max J3 record (no routing in macro mode: there
+                        # is no gate tactic to override; routed stays 0).
+                        fanout_rec = fanout_of(pred.detail)
+                        if not any(v is not None
+                                   for v in fanout_rec.values()):
+                            fanout_rec = None
+                        ds_state, ds_ballot = state, _macros
+                    elif kind == "eco" and snap.ready_to_place:
+                        # Jevfix F3: rule 1 as a harness ballot restriction
+                        # (replaces the FIX-#1 free bypass). The model votes
+                        # the place DIRECTION; every option satisfies rule 1
+                        # so the winner executes whatever the confidence.
+                        _place_ballot = [by_name[n] for n in RULE1_PLACE_NAMES
+                                         if n in by_name]
+                        _place_ballot = (list_executable_candidates(
+                            _place_ballot, snap) or _place_ballot)
+                        ballot_names = [c.name for c in _place_ballot]
+                        pred = await asyncio.to_thread(
+                            backend.predict, state, _place_ballot)
+                        _pbnames = {c.name for c in _place_ballot}
+                        _win = (pred.choice if pred.choice in _pbnames
+                                else "place_ready")
+                        actions = by_name[_win].actions(snap)
+                        if not actions:
+                            _win = "place_ready"
+                            actions = by_name["place_ready"].actions(snap)
+                        gate = GateDecision(
+                            "execute", _win,
+                            f"rule1-place: queue blocked, voted direction "
+                            f"among {len(_place_ballot)} place options",
+                        )
+                        ds_state, ds_ballot = state, _place_ballot
                     # FIX-#2: Building queue non-empty guard (copies
                     # examples/scripted_bot.py:287-292 semantics: any Building
                     # queue item counts as in progress, progress unchecked).
-                    # Ready rows already handled by #1; here only the
-                    # 0%<=progress<99% in-progress case remains -> wait,
-                    # skipping predict (plan verdict (a)).
-                    if fix_tag is None and not cap_stop and kind == "eco" and not snap.ready_to_place:
+                    # Place-blocked rows take the rule1 vote above (Jevfix
+                    # F3); here only the 0%<=progress<99% in-progress case
+                    # remains -> wait, skipping predict (plan verdict (a)).
+                    # Retired in two-phase eco (Jevfix F1 B2: rule 2 gives
+                    # way to the macro mapping; macro rows never reach here).
+                    if (fix_tag is None and not cap_stop and not macro_taken
+                            and kind == "eco" and not snap.ready_to_place):
                         _building_in_queue = any(
                             p.get("queue_type") == "Building"
                             for p in (snap.production or [])
@@ -507,13 +675,21 @@ async def run(args) -> dict:
                                 "FIX-#2 guard: building in queue, skip build_* spam",
                             )
                             actions = by_name["wait"].actions(snap)
-                    if fix_tag is None and not cap_stop:
-                        # A-track wiring (additive; Jev #1/#2/breaker above untouched).
-                        flags = exec_flags(snap)
+                    if fix_tag is None and not cap_stop and not macro_taken:
+                        # A-track wiring (additive; FIX-#2 above untouched).
                         use_cands = candidates
                         if args.backend == "laya":
                             # Laya plan §A1: prefilter; empty ballot -> skip entry.
                             use_cands = list_executable_candidates(candidates, snap)
+                            ballot_names = [c.name for c in use_cands]
+                        elif args.backend in ("jev", "scripted"):
+                            # Jevfix F2: atomic ballot prefilter (train_*
+                            # vs can_make etc.); empty prefilter falls back
+                            # to the full pool (legacy behavior).
+                            use_cands = (list_executable_candidates(
+                                candidates, snap) or candidates)
+                            ballot_names = [c.name for c in use_cands]
+                        else:
                             ballot_names = [c.name for c in use_cands]
                         if args.backend == "nanojev":
                             # NanoJev plan §A3: streak resets on material
@@ -551,35 +727,11 @@ async def run(args) -> dict:
                                 "wait until state changes")
                             actions = []
                         else:
-                            # Jev-max J2: phase-1 macro vote (eco only, bypass
-                            # rows never reach here). Advisory: no gate, the
-                            # vote only prefixes phase-2 state + the log.
-                            state2 = state
-                            if two_phase_on and kind == "eco":
-                                _macros = list_executable_macros(
-                                    list_macro_candidates(), snap)
-                                if _macros:
-                                    _mnames = {m.name for m in _macros}
-                                    pred1 = await asyncio.to_thread(
-                                        backend.predict, state, _macros)
-                                    costs.append(pred1.cost_usd)
-                                    mchoice = (pred1.choice
-                                               if pred1.choice in _mnames
-                                               else _macros[0].name)
-                                    state2 = {"macro": mchoice, **state}
-                                    _, _toks2 = state_to_json(
-                                        state2, args.state_budget)
-                                    macro_entry = {
-                                        "choice": mchoice,
-                                        "probs": pred1.probs,
-                                        "confidence": pred1.confidence,
-                                        "latency_ms": round(
-                                            pred1.latency_ms, 1),
-                                        "cost_usd": pred1.cost_usd,
-                                        "ballot": sorted(_mnames),
-                                        "phase2_tokens": _toks2,
-                                    }
-                            pred = await asyncio.to_thread(backend.predict, state2, use_cands)
+                            # Single-phase vote (two-phase eco/combat rows
+                            # take the Jevfix F1 mapped path above; the old
+                            # advisory re-vote is deleted).
+                            pred = await asyncio.to_thread(
+                                backend.predict, state, use_cands)
                             gate = apply_gate(
                                 pred, use_cands, _make_backend("scripted"),
                                 state, gate_cfg,
@@ -587,23 +739,7 @@ async def run(args) -> dict:
                                         if args.backend == "nanojev" else None))
                             actions = (by_name[gate.choice_name].actions(snap)
                                        if gate.choice_name in by_name else [])
-                            if macro_entry is not None:
-                                # Combined wall-clock latency for the decision;
-                                # phase-1 keeps its own numbers in the entry.
-                                pred.latency_ms = (pred.latency_ms or 0.0) + (
-                                    macro_entry["latency_ms"] or 0.0)
-                                two_phase_lat.append(pred.latency_ms)
-                                if len(two_phase_lat) >= 3:
-                                    _p95 = sorted(two_phase_lat)[
-                                        max(0, int(len(two_phase_lat) * 0.95) - 1)]
-                                    if _p95 > 4000.0:
-                                        two_phase_on = False
-                                        two_phase_disabled_at = i
-                                        print(
-                                            "[demo] TWO-PHASE p95 "
-                                            f"{_p95:.0f}ms > 4000ms at d{i}; "
-                                            "reverting to single-phase",
-                                            flush=True)
+                            ds_state, ds_ballot = state, use_cands
                             # Jev-max J3: fan-out record + goal routing. The
                             # fanout record is kept whenever the backend
                             # answered (Jev); routing needs --goal-route.
@@ -672,7 +808,7 @@ async def run(args) -> dict:
                     # untouched, so the trajectory never forks). Cap/skip
                     # rows never sample (cap stops asking, skip has no ballot).
                     if (args.ablation and abl_entry is None and not is_skip
-                            and not cap_stop
+                            and not cap_stop and not macro_taken
                             and ((i + abl_offset) % _abl_every == 0)):
                         _ab_ballot = candidates
                         if args.backend == "laya":
@@ -715,6 +851,47 @@ async def run(args) -> dict:
                                     fix_tag if fix_tag is not None
                                     else (discard_reason or "unknown")),
                             }
+                    # Jevfix F4D: double-sample diagnosis (record-only, never
+                    # executes: same state+ballot asked twice, agreement + KL).
+                    _ds_every = max(1, int(args.double_sample_every or 10))
+                    if (args.double_sample and ds_rec is None
+                            and ds_state is not None and ds_ballot
+                            and not is_skip and not cap_stop
+                            and pred is not None
+                            and ((i + abl_offset) % _ds_every == 0)):
+                        pred2 = await asyncio.to_thread(
+                            backend.predict, ds_state, ds_ballot)
+                        costs.append(pred2.cost_usd)
+                        _t1 = top1_of(pred.probs)
+                        _t2 = top1_of(pred2.probs)
+                        ds_rec = {
+                            "choice2": pred2.choice,
+                            "agree": bool(_t1 == _t2),
+                            "kl_bits": round(kl_div_bits(
+                                pred2.probs, pred.probs), 4),
+                            "cost_usd": pred2.cost_usd,
+                        }
+                    # Jevfix F4E: second-choice execution. Empty resolved
+                    # actions (and not a deliberate wait) fall through to the
+                    # next choice via predict_with_ban — the SAME function as
+                    # the fallback path, never a separate ranking.
+                    if (args.second_choice and not is_skip and not cap_stop
+                            and pred is not None and not actions
+                            and (macro_taken or gate.choice_name != "wait")):
+                        _from = gate.choice_name
+                        _banned = ({_from} | set(ban_extra)
+                                   | (failed_set
+                                      if args.backend == "nanojev" else set()))
+                        _fb = predict_with_ban(
+                            state, candidates, _banned,
+                            _make_backend("scripted"),
+                            dict(pred.probs or {}))
+                        gate = GateDecision(
+                            "second-choice", _fb.choice,
+                            gate.reason + f" [second-choice from {_from}]")
+                        actions = (by_name[_fb.choice].actions(snap)
+                                   if _fb.choice in by_name else [])
+                        second_rec = {"from": _from, "to": _fb.choice}
                     if is_skip:
                         moved, interrupted = await ex.advance(args.ticks_per_decision)
                         entry = make_skip_entry(
@@ -758,6 +935,12 @@ async def run(args) -> dict:
                         if mchoice is not None:
                             entry["macro"] = mchoice
                             entry["phase1"] = macro_entry
+                        if macro_exec is not None:
+                            entry["macro_exec"] = macro_exec
+                        if second_rec is not None:
+                            entry["second_choice"] = second_rec
+                        if ds_rec is not None:
+                            entry["double_sample"] = ds_rec
                         if fanout_rec is not None:
                             entry["jev_fanout"] = fanout_rec
                         if route_note is not None:
@@ -783,23 +966,8 @@ async def run(args) -> dict:
                                     }) + "\n")
                             else:
                                 streak[kind] = 0
-                    # FIX-#1 breaker: a bypass place that changes nothing on
-                    # the map (online signal) counts a consecutive failure;
-                    # success resets. Only #1-issued places count.
-                    if fix_tag == "#1":
-                        from system1_commander.audit import parse_batch_state as _parse_bs
-                        _post = _parse_bs(rec.batch_note)
-                        if _post is not None and _post.get("own_buildings") is not None:
-                            _placed_ok = _post["own_buildings"] > len(snap.own_buildings)
-                        else:
-                            _placed_ok = bool(rec.batch_ok)
-                        if _placed_ok:
-                            fix1_consec_fails = 0
-                        else:
-                            fix1_consec_fails += 1
-                            if fix1_consec_fails >= 3:
-                                fix1_disabled = True
-                                entry["fix1_breaker"] = "tripped"
+                    # FIX-#1 breaker deleted with the bypass (Jevfix F3: rule 1
+                    # is a model vote now, nothing to trip on).
                     f_orders.write(json.dumps(entry) + "\n")
                     f_orders.flush()
                     decisions_log.append(entry)
@@ -817,8 +985,13 @@ async def run(args) -> dict:
                               f"batch_ok={rec.batch_ok} adv={moved}{'!' if interrupted else ''} "
                               f"{_plat:.0f}ms ${_pcost:.6f}"
                               f"{' fix=' + fix_tag if fix_tag else ''}"
-                              f"{' macro=' + str(mchoice) if mchoice else ''}", flush=True)
+                              f"{' macro=' + str(mchoice) if mchoice else ''}"
+                              f"{' exec=' + str(exec_tag) if exec_tag else ''}", flush=True)
                     if game_done:
+                        break
+                    if stop_after_decision:
+                        print(f"[demo] stopped after d{i}: {two_phase_stop_note}",
+                              flush=True)
                         break
 
             gs, units, buildings = await ex.fetch_raw()
@@ -850,7 +1023,7 @@ async def run(args) -> dict:
         f.write(f"replay={replay_info}\nsha256={replay_hash}\n")
 
     wall_s = time.monotonic() - t_start
-    # FIX-#1/#2 bookkeeping: latency percentiles must EXCLUDE fix-bypass
+    # FIX-#2 bookkeeping: latency percentiles must EXCLUDE fix-bypass
     # rows (0.0 would drag p50 down); cost sums are unaffected (0.0).
     _lat_real = [v for v, f in zip(latencies, fix_flags) if not f] or [0.0]
     _fix1_n = sum(1 for e in decisions_log if e.get("fix_bypass") == "#1")
@@ -876,6 +1049,75 @@ async def run(args) -> dict:
     for _f in _fo_rows:
         _g = str(_f.get("goal"))
         _goal_counts[_g] = _goal_counts.get(_g, 0) + 1
+    # Jevfix tallies (judge recounts from orders.jsonl; bench mirrors).
+    _macro_rows = [e for e in decisions_log if e.get("macro_exec")]
+    _macro_tags: dict[str, int] = {}
+    for _e in _macro_rows:
+        _t = str(_e["macro_exec"].get("tag", "?"))
+        _macro_tags[_t] = _macro_tags.get(_t, 0) + 1
+    _macro_weak = sum(1 for _e in _macro_rows if _e["macro_exec"].get("weak"))
+    _weap_ok = sum(1 for e in decisions_log
+                   if e.get("kind") == "decision"
+                   and e.get("choice") == "build_weap" and e.get("batch_ok"))
+    _second_rows = [e for e in decisions_log if e.get("second_choice")]
+    _second_pairs: dict[str, int] = {}
+    for _e in _second_rows:
+        _k = f"{_e['second_choice'].get('from')}->{_e['second_choice'].get('to')}"
+        _second_pairs[_k] = _second_pairs.get(_k, 0) + 1
+    _ds_rows = [e.get("double_sample") or {} for e in decisions_log
+                if e.get("double_sample")]
+    _ds_agree = sum(1 for _d in _ds_rows if _d.get("agree"))
+    _ds_kl = [float(_d.get("kl_bits", 0.0) or 0.0) for _d in _ds_rows]
+    # Jevfix F2: ballot accounting, three calibers. Macro rows carry the
+    # macro ballot (not an atomic one), so illegality is only defined for
+    # single-phase atomic-ballot rows.
+    _true_rows = [e for e in decisions_log
+                  if e.get("kind") == "decision" and not e.get("fix_bypass")
+                  and not e.get("cap_stop") and e.get("ballot")
+                  and not e.get("macro_exec")]
+    _true_illegal = sum(1 for e in _true_rows
+                        if e.get("choice") not in (e.get("ballot") or []))
+    _bypass_rows = [e for e in decisions_log if e.get("fix_bypass")]
+    # Jevfix F5: combat-macro prior diversity + attack landings.
+    _cmac_set = set(COMBAT_MACRO_NAMES)
+    _cmac_wins: dict[str, int] = {}
+    for _e in _macro_rows:
+        _m = _e["macro_exec"].get("macro")
+        if _m in _cmac_set:
+            _cmac_wins[_m] = _cmac_wins.get(_m, 0) + 1
+    _attack_ok = sum(1 for e in decisions_log
+                     if e.get("kind") == "decision"
+                     and e.get("choice") in ("attack_nearest",
+                                             "all_combat_attack_move",
+                                             "split_harass")
+                     and e.get("batch_ok"))
+    _routed_n = sum(1 for e in decisions_log if e.get("goal_route"))
+    if _routed_n == 0 and args.goal_route:
+        _n_dg = sum(1 for e in decisions_log
+                    if (e.get("gate") or {}).get("mode") == "downgrade"
+                    and e.get("jev_fanout"))
+        _route_idle = (f"goal-route on but 0 routed: {len(_fo_rows)} fanout "
+                       f"rows, {_n_dg} downgrades-with-fanout, macro rows "
+                       "skip routing by design")
+    elif _routed_n == 0:
+        _route_idle = "--goal-route off"
+    else:
+        _route_idle = ""
+    _spawn_side = "?"
+    if spawn_base_cell is not None:
+        _spawn_side = "S" if spawn_base_cell[1] >= 45 else "N"
+    try:
+        import subprocess as _sp
+        _sha = _sp.run(["git", "rev-parse", "HEAD"], capture_output=True,
+                       text=True, timeout=10).stdout.strip()
+        _br = _sp.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                      capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception:  # noqa: BLE001
+        _sha, _br = "", ""
+    _bend: dict[str, int] = {}
+    for _b in (snap_end.own_buildings or []):
+        _t = str(_b.get("type", "?"))
+        _bend[_t] = _bend.get(_t, 0) + 1
     bench = {
         "backend": args.backend,
         "map": snap_end.map_name,
@@ -927,13 +1169,64 @@ async def run(args) -> dict:
             "disabled_at_i": two_phase_disabled_at,
             "p95_ms": round(sorted(two_phase_lat)[
                 max(0, int(len(two_phase_lat) * 0.95) - 1)], 1) if two_phase_lat else 0.0,
+            "cost_phase1_usd": round(cost_phase1_usd, 6),
+            "cost_phase2_usd": round(cost_phase2_usd, 6),
+            "stop_note": two_phase_stop_note,
         },
+        "macro_execute": {
+            "n_phase1": len(_macro_rows),
+            "n_exec": len(_macro_rows),
+            "rate": 1.0 if _macro_rows else 0.0,
+            "by_tag": _macro_tags,
+            "weak_n": _macro_weak,
+            "demand_proxy_n": _macro_tags.get("demand-proxy", 0),
+            "macro_wait_share": round(
+                _macro_tags.get("macro-wait", 0) / len(_macro_rows), 4)
+            if _macro_rows else 0.0,
+            "macro_illegal_wait_share": round(
+                _macro_tags.get("macro-illegal-wait", 0) / len(_macro_rows), 4)
+            if _macro_rows else 0.0,
+            "build_weap_ok": _weap_ok,
+        },
+        "ballot_accounting": {
+            "true": {"n": len(_true_rows), "illegal": _true_illegal,
+                     "illegal_rate": round(_true_illegal / len(_true_rows), 4)
+                     if _true_rows else 0.0},
+            "bypass": {"n": len(_bypass_rows)},
+            "all": {"n": sum(1 for e in decisions_log
+                             if e.get("kind") == "decision")},
+        },
+        "second_choice": {
+            "enabled": bool(args.second_choice),
+            "n": len(_second_rows),
+            "pairs": _second_pairs,
+        },
+        "double_sample": {
+            "enabled": bool(args.double_sample),
+            "every": int(args.double_sample_every or 10),
+            "n": len(_ds_rows),
+            "agree_rate": round(_ds_agree / len(_ds_rows), 4)
+            if _ds_rows else 0.0,
+            "mean_kl_bits": round(sum(_ds_kl) / len(_ds_kl), 4)
+            if _ds_kl else 0.0,
+        },
+        "combat_macros": {
+            "enabled": bool(args.combat_macros),
+            "wins": _cmac_wins,
+            "attack_ok": _attack_ok,
+        },
+        "spawn": {"base_cell": spawn_base_cell, "side": _spawn_side,
+                  "side_rule": "y>=45 -> S else N (pitfight heuristic)"},
+        "code_snapshot": {"branch": _br, "sha": _sha},
+        "army_value_end": snap_end.army_value,
+        "buildings_end_types": _bend,
         "fanout": {
             "n": len(_fo_rows),
             "goal_counts": _goal_counts,
             "threat_true": sum(1 for _f in _fo_rows
                                if truthy_noul(_f.get("threat_recall"))),
-            "routed": sum(1 for e in decisions_log if e.get("goal_route")),
+            "routed": _routed_n,
+            "route_idle_reason": _route_idle,
         },
         "memory": {"enabled": bool(args.memory), "k": MEMORY_K},
         "harvesters_end": snap_end.harvester_count,

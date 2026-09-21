@@ -11,7 +11,11 @@ import os
 import time
 
 from system1_commander.backend_base import Prediction, System1Backend
-from system1_commander.candidates import MACRO_NAMES, Candidate
+from system1_commander.candidates import (
+    COMBAT_MACRO_NAMES,
+    MACRO_NAMES,
+    Candidate,
+)
 
 JEV_MODEL = "jev-1.13.0"
 INPUT_PRICE_PER_MTOK = 0.042
@@ -65,8 +69,10 @@ class JevBackend(System1Backend):
         from typesafe_sdk import Choice, Noul, Score
         names = {c.name for c in candidates}
         # Jev-max J2: phase-1 macro ballot gets the phase-goal manual
-        # (criteria = macro descriptions, soft-replaces iron rule 2);
-        # the iron backup (place-first, ballot-only) stays below.
+        # (criteria = macro descriptions; the iron backup below is context
+        # text — legality is enforced by the harness ballot prefilter, and
+        # the finished-building-first rule by the place-first guard).
+        # Backend-agnostic: plain Candidates.
         if names and names <= set(MACRO_NAMES):
             tactic_instructions = (
                 "Pick the base-wide phase goal for this tick. "
@@ -76,29 +82,43 @@ class JevBackend(System1Backend):
                 "harvesters and tanks; econ_harv = grow ore income with "
                 "another harvester; armor_push = mass light tanks for a "
                 "decisive push. "
-                "Prefer fast_weap when no vehicle production exists yet; "
-                "prefer econ_harv / armor_push only when the economy can "
-                "support them. "
-                "Iron backup: (1) If \"ready_to_place\" is non-empty or "
-                "\"queue_blocked_by_unplaced\" is true, vote \"open_powr\" "
-                "so the finished building gets placed and the queue "
-                "unblocks. "
-                "(3) Only vote for options on this ballot."
+                "fast_weap is the phase goal that unlocks vehicle "
+                "production; econ_harv / armor_push grow income and armor "
+                "once the economy supports them. "
+                "Iron backup (context; the harness places finished "
+                "buildings first): a non-empty \"ready_to_place\" or "
+                "\"queue_blocked_by_unplaced\" blocks the queue until the "
+                "finished building is placed, and open_powr starts by "
+                "placing it. "
+                "Pick one option from this ballot."
+            )
+        elif names and names <= set(COMBAT_MACRO_NAMES):
+            tactic_instructions = (
+                "Pick the combat posture for this tick. "
+                "Postures: defend_hold = screen the base, do not "
+                "overextend; probe_attack = hit the nearest visible enemy "
+                "while keeping the force intact; all_in_commit = drive the "
+                "whole force at the enemy centroid. "
+                "Context: the posture maps onto the attack/defense verbs "
+                "on the next step. "
+                "Pick one option from this ballot."
             )
         else:
             tactic_instructions = (
                 "Given the real-time strategy game state, pick the best tactic. "
-                "Iron rules: (1) If \"ready_to_place\" is non-empty or "
-                "\"queue_blocked_by_unplaced\" is true, you MUST vote "
-                "\"place_ready\" - a finished building left in the queue "
-                "blocks all further production. "
-                "(2) If \"harvesters\" is 0 AND \"harv\" is listed in "
-                "\"can_make\", prefer \"train_harv\": no income means "
-                "slow death. Otherwise (harv not producible, e.g. "
-                "conyard-only with empty available_production) vote "
-                "\"build_powr\" to open the queue. "
-                "(3) Only vote for build/train options listed in \"can_make\": "
-                "voting for anything else wastes the decision."
+                "Iron rules (context; the harness ballot carries the "
+                "admissible options): (1) a finished building in "
+                "\"ready_to_place\" (or \"queue_blocked_by_unplaced\") "
+                "blocks all further production until placed; "
+                "\"place_ready\" (or a directional place_*) is the option "
+                "that places it. "
+                "(2) With 0 \"harvesters\" there is no income; "
+                "\"train_harv\" (when listed in \"can_make\") grows income, "
+                "while a bare Construction Yard with empty "
+                "available_production calls for \"build_powr\" to open "
+                "the queue. "
+                "(3) \"can_make\" lists the currently producible "
+                "build/train options; pick from the ballot."
             )
         return {
             "tactic": Choice(
