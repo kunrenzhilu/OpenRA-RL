@@ -71,8 +71,11 @@ class JevBackend(System1Backend):
                     "\"queue_blocked_by_unplaced\" is true, you MUST vote "
                     "\"place_ready\" - a finished building left in the queue "
                     "blocks all further production. "
-                    "(2) If \"harvesters\" is 0, prefer \"train_harv\" over any "
-                    "other production: no income means slow death. "
+                    "(2) If \"harvesters\" is 0 AND \"harv\" is listed in "
+                    "\"can_make\", prefer \"train_harv\": no income means "
+                    "slow death. Otherwise (harv not producible, e.g. "
+                    "conyard-only with empty available_production) vote "
+                    "\"build_powr\" to open the queue. "
                     "(3) Only vote for build/train options listed in \"can_make\": "
                     "voting for anything else wastes the decision."
                 ),
