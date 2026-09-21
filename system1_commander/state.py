@@ -100,6 +100,10 @@ class Snapshot:
     explored_percent: float = 0.0
     reward_vector: dict = field(default_factory=dict)
     ready_to_place: list = field(default_factory=list)
+    # FIX-#4 hooks: derived bools so the brain does literal matching
+    # instead of parsing the production list itself.
+    queue_blocked_by_unplaced: bool = False
+    building_in_progress: bool = False
 
 
 def _num(d: dict, key: str, default: int = 0) -> int:
@@ -191,6 +195,17 @@ def build_snapshot(game_state: dict, units: list | None = None, buildings: list 
         p.get("item", "") for p in snap.production
         if p.get("queue_type") == "Building" and float(p.get("progress", 0.0) or 0.0) >= 0.99
     ]
+    # FIX-#4 derived hooks (same sources as FIX-#1/#2 in demo_loop.py).
+    snap.queue_blocked_by_unplaced = bool(snap.ready_to_place)
+    def _prog(p: dict) -> float:
+        try:
+            return float(p.get("progress", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+    snap.building_in_progress = any(
+        p.get("queue_type") == "Building" and _prog(p) < 0.99
+        for p in snap.production
+    )
     return snap
 
 
@@ -255,6 +270,8 @@ def build_eco_state(snap: Snapshot) -> dict:
         ],
         "can_make": snap.available_production[:20],
         "ready_to_place": snap.ready_to_place,
+        "queue_blocked_by_unplaced": snap.queue_blocked_by_unplaced,
+        "building_in_progress": snap.building_in_progress,
         "mcv_undeployed": snap.mcv_id if not snap.has_fact else None,
     }
 

@@ -65,7 +65,17 @@ class JevBackend(System1Backend):
         from typesafe_sdk import Choice, Noul, Score
         return {
             "tactic": Choice(
-                instructions="Given the real-time strategy game state, pick the best tactic.",
+                instructions=(
+                    "Given the real-time strategy game state, pick the best tactic. "
+                    "Iron rules: (1) If \"ready_to_place\" is non-empty or "
+                    "\"queue_blocked_by_unplaced\" is true, you MUST vote "
+                    "\"place_ready\" - a finished building left in the queue "
+                    "blocks all further production. "
+                    "(2) If \"harvesters\" is 0, prefer \"train_harv\" over any "
+                    "other production: no income means slow death. "
+                    "(3) Only vote for build/train options listed in \"can_make\": "
+                    "voting for anything else wastes the decision."
+                ),
                 criteria={c.name: c.description for c in candidates},
             ),
             "risk_under_attack": Noul(

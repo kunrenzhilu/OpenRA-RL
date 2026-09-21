@@ -76,7 +76,8 @@ async def run(args) -> dict:
         state_to_json,
     )
     from system1_commander.executor import Executor
-    from system1_commander.gate import GateConfig
+    from system1_commander.gate import GateConfig, GateDecision
+    from system1_commander.backend_base import Prediction
     from system1_commander.state import Snapshot
 
     os.makedirs(args.log_dir, exist_ok=True)
@@ -101,8 +102,11 @@ async def run(args) -> dict:
 
     t_start = time.monotonic()
     latencies, costs, state_toks = [], [], []
+    fix_flags = []  # parallel to latencies/costs: True when row bypassed predict (#1/#2)
     decisions_log = []
     gate_modes, kinds_used = [], []
+    # FIX-#1 breaker: consecutive bypass-place failures; >=3 disables #1 for the game.
+    fix1_disabled, fix1_consec_fails = False, 0
     game_done, game_result, surrendered = False, "", False
     error_note = ""
     n_buildings_0, mil0 = 0, (0, 0, 0, 0, 0)
@@ -212,14 +216,58 @@ async def run(args) -> dict:
                     state = builders[kind](snap)
                     state_json, toks = state_to_json(state)
                     state_toks.append(toks)
-                    pred = await asyncio.to_thread(backend.predict, state, candidates)
+                    guard_actions = by_name["guard_choke"].actions(snap) if "guard_choke" in by_name else None
+                    # FIX-#1: ready_to_place non-empty hard-cut to place_ready
+                    # (eco only, builder double-checked, skips predict).
+                    fix_tag = None
+                    if kind == "eco" and not fix1_disabled and snap.ready_to_place:
+                        _place_actions = by_name["place_ready"].actions(snap)
+                        if _place_actions:
+                            fix_tag = "#1"
+                            pred = Prediction(
+                                choice="place_ready", probs={"place_ready": 1.0},
+                                confidence=1.0, latency_ms=0.0, cost_usd=0.0,
+                                backend="fix-bypass",
+                                detail={"skipped_predict": True},
+                            )
+                            gate = GateDecision(
+                                "execute", "place_ready",
+                                f"FIX-#1 hard-cut: ready_to_place={snap.ready_to_place}",
+                            )
+                            actions = _place_actions
+                    # FIX-#2: Building queue non-empty guard (copies
+                    # examples/scripted_bot.py:287-292 semantics: any Building
+                    # queue item counts as in progress, progress unchecked).
+                    # Ready rows already handled by #1; here only the
+                    # 0%<=progress<99% in-progress case remains -> wait,
+                    # skipping predict (plan verdict (a)).
+                    if fix_tag is None and kind == "eco" and not snap.ready_to_place:
+                        _building_in_queue = any(
+                            p.get("queue_type") == "Building"
+                            for p in (snap.production or [])
+                        )
+                        if _building_in_queue:
+                            fix_tag = "#2"
+                            pred = Prediction(
+                                choice="wait", probs={"wait": 1.0},
+                                confidence=1.0, latency_ms=0.0, cost_usd=0.0,
+                                backend="fix-bypass",
+                                detail={"skipped_predict": True},
+                            )
+                            gate = GateDecision(
+                                "downgrade", "wait",
+                                "FIX-#2 guard: building in queue, skip build_* spam",
+                            )
+                            actions = by_name["wait"].actions(snap)
+                    if fix_tag is None:
+                        pred = await asyncio.to_thread(backend.predict, state, candidates)
+                        gate = apply_gate(pred, candidates, _make_backend("scripted"), state, gate_cfg)
+                        actions = by_name[gate.choice_name].actions(snap)
                     latencies.append(pred.latency_ms)
                     costs.append(pred.cost_usd)
-                    gate = apply_gate(pred, candidates, _make_backend("scripted"), state, gate_cfg)
+                    fix_flags.append(fix_tag is not None)
                     gate_modes.append(gate.mode)
                     kinds_used.append(kind)
-                    actions = by_name[gate.choice_name].actions(snap)
-                    guard_actions = by_name["guard_choke"].actions(snap) if "guard_choke" in by_name else None
                     rec = await ex.execute(gate.choice_name, actions, snap.tick, guard_actions)
                     moved, interrupted = await ex.advance(args.ticks_per_decision)
                     rec.advance_ticks = moved
@@ -231,13 +279,33 @@ async def run(args) -> dict:
                         "prediction": pred.to_dict(), "gate": gate.to_dict(),
                         **rec.to_dict(),
                     }
+                    if fix_tag is not None:
+                        entry["fix_bypass"] = fix_tag
+                    # FIX-#1 breaker: a bypass place that changes nothing on
+                    # the map (online signal) counts a consecutive failure;
+                    # success resets. Only #1-issued places count.
+                    if fix_tag == "#1":
+                        from system1_commander.audit import parse_batch_state as _parse_bs
+                        _post = _parse_bs(rec.batch_note)
+                        if _post is not None and _post.get("own_buildings") is not None:
+                            _placed_ok = _post["own_buildings"] > len(snap.own_buildings)
+                        else:
+                            _placed_ok = bool(rec.batch_ok)
+                        if _placed_ok:
+                            fix1_consec_fails = 0
+                        else:
+                            fix1_consec_fails += 1
+                            if fix1_consec_fails >= 3:
+                                fix1_disabled = True
+                                entry["fix1_breaker"] = "tripped"
                     f_orders.write(json.dumps(entry) + "\n")
                     f_orders.flush()
                     decisions_log.append(entry)
                     print(f"[demo] d{i}: tick={snap.tick} [{kind}] toks={toks} "
                           f"pred={pred.choice}@{pred.confidence:.2f} gate={gate.mode}:{gate.choice_name} "
                           f"batch_ok={rec.batch_ok} adv={moved}{'!' if interrupted else ''} "
-                          f"{pred.latency_ms:.0f}ms ${pred.cost_usd:.6f}", flush=True)
+                          f"{pred.latency_ms:.0f}ms ${pred.cost_usd:.6f}"
+                          f"{' fix=' + fix_tag if fix_tag else ''}", flush=True)
                     if game_done:
                         break
 
@@ -270,6 +338,11 @@ async def run(args) -> dict:
         f.write(f"replay={replay_info}\nsha256={replay_hash}\n")
 
     wall_s = time.monotonic() - t_start
+    # FIX-#1/#2 bookkeeping: latency percentiles must EXCLUDE fix-bypass
+    # rows (0.0 would drag p50 down); cost sums are unaffected (0.0).
+    _lat_real = [v for v, f in zip(latencies, fix_flags) if not f] or [0.0]
+    _fix1_n = sum(1 for e in decisions_log if e.get("fix_bypass") == "#1")
+    _fix2_n = sum(1 for e in decisions_log if e.get("fix_bypass") == "#2")
     bench = {
         "backend": args.backend,
         "map": snap_end.map_name,
@@ -293,8 +366,12 @@ async def run(args) -> dict:
         "kills_cost_delta": snap_end.kills_cost - mil0[2],
         "deaths_cost_delta": snap_end.deaths_cost - mil0[3],
         "orders_delta": snap_end.order_count - mil0[4],
-        "latency_ms_p50": round(statistics.median(latencies), 1) if latencies else 0.0,
-        "latency_ms_p95": round(sorted(latencies)[max(0, int(len(latencies) * 0.95) - 1)], 1) if latencies else 0.0,
+        "latency_ms_p50": round(statistics.median(_lat_real), 1),
+        "latency_ms_p95": round(sorted(_lat_real)[max(0, int(len(_lat_real) * 0.95) - 1)], 1),
+        "latency_note": "p50/p95 exclude fix_bypass rows",
+        "fix_bypass_counts": {"#1": _fix1_n, "#2": _fix2_n},
+        "harvesters_end": snap_end.harvester_count,
+        "cash_end": snap_end.cash, "ore_end": snap_end.ore,
         "state_tokens_p50": statistics.median(state_toks) if state_toks else 0,
         "cost_usd_total": round(sum(costs), 6),
         "game_done": game_done, "game_result": game_result,
