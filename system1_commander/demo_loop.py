@@ -8,6 +8,10 @@ Usage:
 Outputs in log-dir: orders.jsonl (one record per decision), bench.json
 (summary), replay.txt (replay path + hash). Replays (*.orarep) and *.jsonl
 are never committed.
+
+Bench carries ground-truth fields from system1_commander.audit
+(map_visible_orders / noop_ok_count / cash_spent ...): never use
+``batch_ok`` counts as "orders placed" again.
 """
 
 from __future__ import annotations
@@ -103,6 +107,7 @@ async def run(args) -> dict:
     error_note = ""
     n_buildings_0, mil0 = 0, (0, 0, 0, 0, 0)
     last_snap, snap_end, replay_info = None, None, ""
+    deploy_rec = None
 
     try:
         async with OpenRAMCPClient(base_url=args.url, message_timeout_s=300.0) as client:
@@ -297,6 +302,26 @@ async def run(args) -> dict:
         "orders_log": os.path.abspath(orders_path),
         "ts": datetime.now(timezone.utc).isoformat(),
     }
+    # Ground truth (audit.py): map-observed orders, not batch_ok counts.
+    # Deploy record (if any) seeds the baseline so its take-effect delta is
+    # not misattributed to a later decision. Pure offline diff, no server.
+    try:
+        from system1_commander.audit import audit_decisions
+        _truth = audit_decisions(
+            decisions_log,
+            baseline=deploy_rec.to_dict() if deploy_rec is not None else None,
+        )["summary"]
+    except Exception:  # noqa: BLE001
+        _truth = {}
+    bench.update({
+        "map_visible_orders": _truth.get("map_visible_orders", 0),
+        "noop_ok_count": _truth.get("noop_ok", 0),
+        "cash_spent": _truth.get("cash_spent", 0),
+        "empty_ok_count": _truth.get("empty_ok", 0),
+        "failed_real_count": _truth.get("failed", 0),
+        "queue_peak_full": _truth.get("queue_peak_full", 0),
+        "queue_peak_visible": _truth.get("queue_peak_visible", 0),
+    })
     with open(bench_path, "w") as f:
         json.dump(bench, f, indent=2)
     print(f"[demo] bench -> {os.path.abspath(bench_path)}", flush=True)
