@@ -120,6 +120,65 @@ def jev_goal_route(*, gate_mode: str, gate_choice: str,
     return None, ""
 
 
+# ── Jev-max J4: trajectory summarizer (pure; K=10 segments) ──
+MEMORY_K = 10
+
+
+def summarize_trajectory(rows: list[dict] | None, k: int = MEMORY_K) -> dict:
+    """Compress the last K decision rows into a memory dict.
+
+    Pure function of orders.jsonl rows: verdicts via audit_decisions,
+    cash curve via parse_batch_state (observed cash only). The judge
+    replays it offline with zero cost. Non-decision rows (deploy/alarm/
+    skip) are ignored. `segs` is oldest-first so attach_history can trim
+    the oldest first under its token budget.
+    """
+    from system1_commander.audit import audit_decisions, parse_batch_state
+
+    dec = [r for r in (rows or []) if r.get("kind", "decision") == "decision"]
+    dec = dec[-max(1, int(k)):]
+    verdicts = ["" for _ in dec]
+    try:
+        verdicts = [str(r.get("verdict", ""))
+                    for r in audit_decisions(dec)["rows"]]
+    except Exception:  # noqa: BLE001 - memory must never break the loop
+        pass
+    segs, cash = [], []
+    for r, v in zip(dec, verdicts):
+        try:
+            st = parse_batch_state(r.get("batch_note", ""))
+        except Exception:  # noqa: BLE001
+            st = None
+        if isinstance(st, dict) and st.get("cash") is not None:
+            try:
+                cash.append(int(st["cash"]))
+            except (TypeError, ValueError):
+                pass
+        segs.append({"i": r.get("i"), "tick": r.get("tick"),
+                     "choice": str(r.get("choice", "")),
+                     "gate": str((r.get("gate") or {}).get("mode", "")),
+                     "verdict": v})
+    if len(cash) <= 5:
+        curve = list(cash)
+    else:
+        curve = [cash[round(i * (len(cash) - 1) / 4)] for i in range(5)]
+    counts: dict[str, int] = {}
+    for s in segs:
+        counts[s["choice"]] = counts.get(s["choice"], 0) + 1
+    vcounts: dict[str, int] = {}
+    for v in verdicts:
+        vcounts[v or "?"] = vcounts.get(v or "?", 0) + 1
+    return {
+        "k": int(k),
+        "n": len(segs),
+        "tick_span": [segs[0]["tick"], segs[-1]["tick"]] if segs else [],
+        "choice_counts": counts,
+        "verdict_counts": vcounts,
+        "cash_curve": curve,
+        "segs": segs,
+    }
+
+
 def _parse_args(argv=None):
     p = argparse.ArgumentParser(description="System1 commander demo loop (P0).")
     p.add_argument("--backend", choices=["scripted", "jev", "nanojev", "laya"], default="scripted")
@@ -166,6 +225,12 @@ def _parse_args(argv=None):
                         "results discarded -> fallback; goal=defend + threat "
                         "overrides aggressive tactics). No-op for backends "
                         "without goal answers.")
+    # Jev-max J4: external memory on the poor state (baseline capability).
+    p.add_argument("--memory", action="store_true",
+                   help="J4: attach the K=10 trajectory summary as the "
+                        "history state field (300 toks, oldest trimmed). "
+                        "With --ablation, memory is held constant and the "
+                        "rich branch adds only the five J1 fields.")
     return p.parse_args(argv)
 
 
@@ -204,6 +269,7 @@ async def run(args) -> dict:
     from system1_commander.backend_base import Prediction
     from system1_commander.state import Snapshot
     from system1_commander.state import (  # Jev-max J1 (module import: __init__ untouched)
+        attach_history,  # J4
         attach_rich_fields,
         observe_trackers,
         reset_trackers,
@@ -363,6 +429,11 @@ async def run(args) -> dict:
                     by_name = {c.name: c for c in candidates}
                     observe_trackers(snap)  # Jev-max J1: feed enemy/traj memory.
                     state = builders[kind](snap)
+                    if args.memory:  # Jev-max J4: history on the poor state.
+                        _mem_rows = [e for e in decisions_log
+                                     if e.get("kind") == "decision"]
+                        state = attach_history(
+                            state, summarize_trajectory(_mem_rows))
                     state_json, toks = state_to_json(state, args.state_budget)
                     state_toks.append(toks)
                     guard_actions = by_name["guard_choke"].actions(snap) if "guard_choke" in by_name else None
@@ -806,6 +877,7 @@ async def run(args) -> dict:
                                if truthy_noul(_f.get("threat_recall"))),
             "routed": sum(1 for e in decisions_log if e.get("goal_route")),
         },
+        "memory": {"enabled": bool(args.memory), "k": MEMORY_K},
         "harvesters_end": snap_end.harvester_count,
         "cash_end": snap_end.cash, "ore_end": snap_end.ore,
         "state_tokens_p50": statistics.median(state_toks) if state_toks else 0,

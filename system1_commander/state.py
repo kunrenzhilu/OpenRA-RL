@@ -587,3 +587,26 @@ def attach_rich_fields(state: dict, snap: Snapshot) -> dict:
     out["minimap"] = _cap_text(snap.minimap or "",
                                RICH_TOKEN_CAPS["minimap"])
     return out
+
+
+# ── Jev-max J4: external memory field (backend-agnostic) ──
+HISTORY_TOKEN_BUDGET = 300
+
+
+def attach_history(state: dict, summary: dict | None,
+                   budget: int = HISTORY_TOKEN_BUDGET) -> dict:
+    """Return a copy of `state` plus the capped `history` field.
+
+    `summary` comes from demo_loop.summarize_trajectory (oldest-first
+    `segs`); over-budget trims the oldest segs first, and drops `segs`
+    entirely as a last resort rather than exceed the budget.
+    """
+    out = dict(state)
+    if not summary:
+        return out
+    summ = _trim_lists_oldest(dict(summary), ["segs"], budget)
+    if not _fits(summ, budget):
+        summ = dict(summ)
+        summ["segs"] = []
+    out["history"] = summ
+    return out
