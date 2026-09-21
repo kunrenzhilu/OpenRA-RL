@@ -132,12 +132,15 @@ def test_macro_table_full_and_qualified():
 
 
 def test_macro_prefilter_can_make():
+    # Jevfix F6 (rev4): macro ballot 永不预过滤 —— 5 宏恒在票上，
+    # can_make 只影响执行映射（demand-proxy），不影响上票。
     ms = list_macro_candidates()
     conyard = Snapshot(available_production=[])
     assert [m.name for m in list_executable_macros(ms, conyard)] == [
-        "open_powr", "rush_barr", "fast_weap"]
+        "open_powr", "rush_barr", "fast_weap", "econ_harv", "armor_push"]
     full = Snapshot(available_production=["harv", "1tnk"])
-    assert len(list_executable_macros(ms, full)) == 5
+    assert [m.name for m in list_executable_macros(ms, full)] == [
+        "open_powr", "rush_barr", "fast_weap", "econ_harv", "armor_push"]
 
 
 def test_macro_builders_first_legal_step():
