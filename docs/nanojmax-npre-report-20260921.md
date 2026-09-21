@@ -16,7 +16,7 @@
 A1 `orders.jsonl` 不存 state 明文，无法重放 179 states。按 supervisor 指令打短收集局：
 
 - 局：`.runs/nanojmax-npre-collect-20260921`（nanojev / mix eco,combat / 50 决策 / 50 ticks）
-- bench：decisions=50（真投票 45 + bypass 5：#1×2、#2×3），wall=125.8s，
+- bench：decisions=50（真投票 45 + bypass 5：#1×2、#2×3），wall=125.8s（stdout 时钟；bench `wall_s=123.7`，口径差 2.1s，不影响任何冻结判定），
   gate=fallback/downgrade（真 execute=0，与 A1 同构），map_visible_orders=2，
   empty_ok=45，failed_real=1，cash_spent=800，game_done=false（短局主动收尾）
 - 产物：`orders.jsonl` + `states.jsonl`（50 states，`scripts/n_collect.py` tee 落盘）
@@ -31,7 +31,7 @@ max_length 卡的是**单候选 path**（max leaf），不是整请求。
 | 书 | 口径 | 实测（50 states） |
 |---|---|---|
 | state 段 | `State:\n…\n` 段 Qwen tokens | eco ~109–171，combat ~74–76（Python 尺 `toks=` 约为其 0.7×，两把尺不对齐） |
-| 单候选 path | max leaf（含 prefix+Candidate+Decision+eos） | **worst 213**（seq=16 eco tick=1066；eco 208–213，combat 112–120） |
+| 单候选 path | max leaf（含 prefix+Candidate+Decision+eos） | **worst 213**（seq=16 eco tick=1066；eco path_max 全量 151–213，其中 seq≥14 后稳态 208–213；combat path_max 全量 118–120，112 为 path_min） |
 | 整请求 | 单 tactic 问全候选 leaves 之和 | eco ~1888，combat ~706（仅参考，不进门控） |
 
 ### T1 冻结
