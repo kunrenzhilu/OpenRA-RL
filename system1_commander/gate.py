@@ -119,10 +119,20 @@ def apply_gate(
             f"conf {pred.confidence:.2f}>= {cfg.high} or "
             f"margin {top1_margin(pred.probs):.2f}>= {cfg.margin_min}")
     if pred.confidence >= cfg.low:
+        # N0 (NanoJev-max): the downgrade pick must respect per-game failure
+        # memory; a banned head is skipped for the next table entry, and an
+        # all-banned table falls through to predict_with_ban. Empty/None
+        # banned == legacy behaviour, bit-identical (same pick, same text).
+        banned_set = set(banned or ())
         for name in DOWNGRADE_ORDER:
-            if name in by_name:
+            if name in by_name and name not in banned_set:
                 return GateDecision("downgrade", name,
                                     f"conf {pred.confidence:.2f} in [{cfg.low},{cfg.high}) "
                                     f"margin {top1_margin(pred.probs):.2f} -> {name}")
+        if any(n in by_name for n in DOWNGRADE_ORDER):
+            fb = predict_with_ban(state, candidates, banned, scripted, pred.probs)
+            return GateDecision("fallback", fb.choice,
+                                f"downgrade table all banned {sorted(banned_set)} "
+                                f"-> scripted {fb.choice}")
     fb = predict_with_ban(state, candidates, banned, scripted, pred.probs)
     return GateDecision("fallback", fb.choice, f"conf {pred.confidence:.2f} < {cfg.low} -> scripted")
