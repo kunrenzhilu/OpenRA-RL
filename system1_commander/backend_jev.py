@@ -115,6 +115,30 @@ class JevBackend(System1Backend):
                 criteria={"true": "Attacking now risks losing weak units for no gain.",
                           "false": "Attacking now is safe or favorable."},
             ),
+            # Jev-max J3: fan-out extras in the SAME call (near-zero added
+            # latency per the official fan-out pattern). goal routes code;
+            # phase/threat are speculative (use-if-relevant per pattern).
+            "goal": Choice(
+                instructions=(
+                    "What should our base focus on in this phase of the game?"
+                ),
+                criteria={
+                    "expand_eco": "Grow the economy: power, harvesters, ore income.",
+                    "tech_up": "Climb technology: War Factory and advanced structures.",
+                    "mass_army": "Build an attack force: infantry and tanks.",
+                    "defend": "Defend the base: hold position, do not overextend.",
+                },
+            ),
+            "threat_recall": Noul(
+                instructions="Should our forces fall back to defend the base?",
+                criteria={"true": "Yes: recall forces, the base needs defense.",
+                          "false": "No: forces can stay out / keep pressure."},
+            ),
+            "phase": Score(
+                instructions="Which phase of the game is this?",
+                criteria=["early game opening", "mid game buildup",
+                          "late game endgame"],
+            ),
             "danger": Score(
                 instructions="Rate the overall danger to our forces and base.",
                 criteria=["no danger", "minor threat", "moderate threat",
@@ -159,6 +183,18 @@ class JevBackend(System1Backend):
             "output_tokens": out_tok,
         }
         try:
+            # Jev-max J3: every Choice answer (tactic + goal) lands in
+            # detail["choices"] so demo_loop can route on goal; tactic also
+            # stays top-level for the legacy gate path.
+            if isinstance(choices, dict):
+                detail["choices"] = {
+                    k: {
+                        "choice": getattr(v, "choice", None),
+                        "probs": dict(getattr(v, "probabilities", {}) or {}),
+                        "confidence": float(getattr(v, "confidence", 0.0) or 0.0),
+                    }
+                    for k, v in choices.items()
+                }
             nouls = getattr(resp, "nouls", None) or (getattr(resp, "answers", {}) or {}).get("nouls", {})
             scores = getattr(resp, "scores", None) or (getattr(resp, "answers", {}) or {}).get("scores", {})
             if isinstance(nouls, dict):

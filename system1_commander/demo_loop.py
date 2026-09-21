@@ -64,6 +64,62 @@ def kl_div_bits(p: dict | None, q: dict | None, eps: float = 1e-9) -> float:
     return kl
 
 
+# ── Jev-max J3: fan-out extract + goal routing (pure) ──
+
+def truthy_noul(v) -> bool:
+    """Normalize a Noul answer (bool or 'true'/'false' str) to bool."""
+    if isinstance(v, bool):
+        return v
+    return str(v or "").strip().lower() in ("true", "1", "yes", "y")
+
+
+def fanout_of(pred_detail: dict | None) -> dict:
+    """Extract {goal, goal_conf, phase, threat_recall, danger} from a
+    predict detail dict. Backend-agnostic: unknown backends yield Nones."""
+    d = pred_detail or {}
+    ch = d.get("choices") or {}
+    goal = ch.get("goal") or {}
+    nl = d.get("nouls") or {}
+    sc = d.get("scores") or {}
+    return {
+        "goal": goal.get("choice"),
+        "goal_conf": goal.get("confidence"),
+        "phase": sc.get("phase"),
+        "threat_recall": nl.get("threat_recall"),
+        "danger": sc.get("danger"),
+    }
+
+
+_FALLBACK_SENTINEL = "__fallback__"
+_AGGRESSIVE_TACTICS = ("attack_nearest", "all_combat_attack_move")
+_DEFENSIVE_FALLBACKS = ("guard_choke", "hold_position")
+
+
+def jev_goal_route(*, gate_mode: str, gate_choice: str,
+                   ballot_names: list[str],
+                   fanout: dict | None) -> tuple[str | None, str]:
+    """Pure J3 routing decision. Returns (override|None, note).
+
+    - downgrade -> ALWAYS re-resolve via fallback (downgrade results are
+      discarded: A-track breakpoint 2 unfixed, plan §3 footnote).
+      Signals _FALLBACK_SENTINEL (caller runs predict_with_ban).
+    - goal=defend + threat_recall + aggressive tactic -> defensive choice
+      when on the ballot, else the sentinel.
+    - otherwise None (keep the gate's verdict).
+    """
+    fo = fanout or {}
+    if gate_mode == "downgrade":
+        return _FALLBACK_SENTINEL, "downgrade-discarded->fallback"
+    if (fo.get("goal") == "defend"
+            and truthy_noul(fo.get("threat_recall"))
+            and gate_choice in _AGGRESSIVE_TACTICS):
+        for n in _DEFENSIVE_FALLBACKS:
+            if n in ballot_names:
+                return n, "goal=defend+threat->defensive"
+        return _FALLBACK_SENTINEL, "goal=defend+threat->fallback"
+    return None, ""
+
+
 def _parse_args(argv=None):
     p = argparse.ArgumentParser(description="System1 commander demo loop (P0).")
     p.add_argument("--backend", choices=["scripted", "jev", "nanojev", "laya"], default="scripted")
@@ -104,6 +160,12 @@ def _parse_args(argv=None):
                    help="J2: phase-1 votes a macro, phase-2 picks the atomic "
                         "action with macro=<round-1> prefixed to the state. "
                         "Auto-reverts to single-phase if two-phase p95 > 4s.")
+    # Jev-max J3: goal routing (execute/fallback only, downgrade discarded).
+    p.add_argument("--goal-route", action="store_true",
+                   help="J3: route on the fan-out goal Choice (downgrade "
+                        "results discarded -> fallback; goal=defend + threat "
+                        "overrides aggressive tactics). No-op for backends "
+                        "without goal answers.")
     return p.parse_args(argv)
 
 
@@ -138,7 +200,7 @@ async def run(args) -> dict:
         state_to_json,
     )
     from system1_commander.executor import Executor
-    from system1_commander.gate import GateConfig, GateDecision
+    from system1_commander.gate import GateConfig, GateDecision, predict_with_ban
     from system1_commander.backend_base import Prediction
     from system1_commander.state import Snapshot
     from system1_commander.state import (  # Jev-max J1 (module import: __init__ untouched)
@@ -312,6 +374,7 @@ async def run(args) -> dict:
                     is_skip = False
                     abl_entry = None  # Jev-max J1: filled on sampled ticks.
                     mchoice, macro_entry = None, None  # Jev-max J2.
+                    fanout_rec, route_note = None, None  # Jev-max J3.
                     # Plan §7 cost cap: stop asking, save the game. Once hit,
                     # every remaining decision is wait (advance only); the
                     # ablation sampler below also stops (pred is synthetic).
@@ -468,6 +531,38 @@ async def run(args) -> dict:
                                             f"{_p95:.0f}ms > 4000ms at d{i}; "
                                             "reverting to single-phase",
                                             flush=True)
+                            # Jev-max J3: fan-out record + goal routing. The
+                            # fanout record is kept whenever the backend
+                            # answered (Jev); routing needs --goal-route.
+                            fanout_rec = fanout_of(pred.detail)
+                            if not any(v is not None
+                                       for v in fanout_rec.values()):
+                                fanout_rec = None
+                            if args.goal_route and fanout_rec is not None:
+                                _ov, _note = jev_goal_route(
+                                    gate_mode=gate.mode,
+                                    gate_choice=gate.choice_name,
+                                    ballot_names=[c.name for c in use_cands],
+                                    fanout=fanout_rec)
+                                if _ov == _FALLBACK_SENTINEL:
+                                    _sb = _make_backend("scripted")
+                                    _fb = predict_with_ban(
+                                        state, use_cands,
+                                        (failed_set if args.backend == "nanojev"
+                                         else None), _sb, pred.probs)
+                                    gate = GateDecision(
+                                        "fallback", _fb.choice,
+                                        gate.reason + f" [jevmax-route: {_note}]")
+                                    actions = (by_name[gate.choice_name].actions(snap)
+                                               if gate.choice_name in by_name else [])
+                                    route_note = _note
+                                elif _ov is not None:
+                                    gate = GateDecision(
+                                        "fallback", _ov,
+                                        gate.reason + f" [jevmax-route: {_note}]")
+                                    actions = (by_name[_ov].actions(snap)
+                                               if _ov in by_name else [])
+                                    route_note = _note
                             # Jev-max J1 ablation: same-tick poor/rich dual ask.
                             # ALWAYS executes the poor branch (pred/gate/actions
                             # above untouched); the rich branch is record-only.
@@ -541,6 +636,10 @@ async def run(args) -> dict:
                         if mchoice is not None:
                             entry["macro"] = mchoice
                             entry["phase1"] = macro_entry
+                        if fanout_rec is not None:
+                            entry["jev_fanout"] = fanout_rec
+                        if route_note is not None:
+                            entry["goal_route"] = route_note
                         # Laya plan §A2: honest books; batch_ok / gate.mode frozen.
                         if not rec.actions and rec.choice != "wait":
                             entry["noop_alarm"] = True
@@ -645,6 +744,13 @@ async def run(args) -> dict:
     _abl_rows = [e["ablation"] for e in decisions_log if e.get("ablation")]
     _abl_flips = sum(1 for a in _abl_rows if a.get("flipped"))
     _abl_kl = [float(a.get("kl_bits", 0.0) or 0.0) for a in _abl_rows]
+    # Jev-max J3: fan-out tallies (Noul/Score truly wired into stats).
+    _fo_rows = [e.get("jev_fanout") or {} for e in decisions_log
+                if e.get("jev_fanout")]
+    _goal_counts: dict[str, int] = {}
+    for _f in _fo_rows:
+        _g = str(_f.get("goal"))
+        _goal_counts[_g] = _goal_counts.get(_g, 0) + 1
     bench = {
         "backend": args.backend,
         "map": snap_end.map_name,
@@ -692,6 +798,13 @@ async def run(args) -> dict:
             "disabled_at_i": two_phase_disabled_at,
             "p95_ms": round(sorted(two_phase_lat)[
                 max(0, int(len(two_phase_lat) * 0.95) - 1)], 1) if two_phase_lat else 0.0,
+        },
+        "fanout": {
+            "n": len(_fo_rows),
+            "goal_counts": _goal_counts,
+            "threat_true": sum(1 for _f in _fo_rows
+                               if truthy_noul(_f.get("threat_recall"))),
+            "routed": sum(1 for e in decisions_log if e.get("goal_route")),
         },
         "harvesters_end": snap_end.harvester_count,
         "cash_end": snap_end.cash, "ore_end": snap_end.ore,
