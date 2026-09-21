@@ -56,7 +56,11 @@ def main(argv=None) -> int:
         ab = r.get("ablation")
         if not ab:
             continue
-        poor_probs = (r.get("prediction") or {}).get("probs") or {}
+        # Voted ticks: poor vote = entry.prediction. Bypass-row ticks: the
+        # vote was discarded, poor vote lives inside the ablation record.
+        poor_probs = ab.get("poor_probs")
+        if poor_probs is None:
+            poor_probs = (r.get("prediction") or {}).get("probs") or {}
         rich_probs = ab.get("rich_probs") or {}
         t_poor, t_rich = top1_of(poor_probs), top1_of(rich_probs)
         samples.append({
@@ -67,6 +71,7 @@ def main(argv=None) -> int:
             "rich_top1": t_rich,
             "flipped": bool(t_poor != t_rich),
             "kl_bits": round(kl_div_bits(rich_probs, poor_probs), 4),
+            "discarded_by": ab.get("discarded_by"),
             "logged_flip": ab.get("flipped"),
             "logged_kl": ab.get("kl_bits"),
         })
@@ -74,14 +79,22 @@ def main(argv=None) -> int:
     n = len(samples)
     flips = sum(1 for s in samples if s["flipped"])
     mean_kl = sum(s["kl_bits"] for s in samples) / n if n else 0.0
-    out = {"n": n, "flips": flips,
+    voted = [s for s in samples if not s["discarded_by"]]
+    vflips = sum(1 for s in voted if s["flipped"])
+    vkl = sum(s["kl_bits"] for s in voted) / len(voted) if voted else 0.0
+    out = {"n": n, "n_voted": len(voted), "n_discarded": n - len(voted),
+           "flips": flips,
            "flip_rate": round(flips / n, 4) if n else 0.0,
-           "mean_kl_bits": round(mean_kl, 4)}
-    print(f"{'i':>4} {'tick':>6} {'kind':>7} {'poor':>14} {'rich':>14} {'flip':>5} {'kl':>8}")
+           "mean_kl_bits": round(mean_kl, 4),
+           "voted_flip_rate": round(vflips / len(voted), 4) if voted else 0.0,
+           "voted_mean_kl_bits": round(vkl, 4)}
+    print(f"{'i':>4} {'tick':>6} {'kind':>7} {'poor':>14} {'rich':>14} "
+          f"{'flip':>5} {'kl':>8} {'discarded_by':>12}")
     for s in samples:
         print(f"{s['i']:>4} {s['tick']:>6} {str(s['kind']):>7} "
               f"{str(s['poor_top1']):>14} {str(s['rich_top1']):>14} "
-              f"{str(s['flipped']):>5} {s['kl_bits']:>8.4f}")
+              f"{str(s['flipped']):>5} {s['kl_bits']:>8.4f} "
+              f"{str(s['discarded_by']):>12}")
     print(json.dumps(out, indent=2))
 
     mism = [s for s in samples
@@ -93,10 +106,10 @@ def main(argv=None) -> int:
     if args.bench:
         with open(args.bench) as f:
             bench_ab = json.load(f).get("ablation", {})
-        ok = (bench_ab.get("n") == n
-              and bench_ab.get("flips") == flips
-              and abs((bench_ab.get("flip_rate") or 0) - out["flip_rate"]) < 1e-9
-              and abs((bench_ab.get("mean_kl_bits") or 0) - out["mean_kl_bits"]) < 1e-3)
+        keys = ["n", "n_voted", "n_discarded", "flips", "flip_rate",
+                "mean_kl_bits", "voted_flip_rate", "voted_mean_kl_bits"]
+        ok = all(abs((bench_ab.get(k) or 0) - (out.get(k) or 0)) < 1e-3
+                 for k in keys)
         print("bench.json ablation block:", json.dumps(bench_ab),
               "-> MATCH" if ok else "-> MISMATCH")
         return 0 if ok and not mism else 2

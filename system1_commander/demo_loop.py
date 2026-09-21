@@ -446,6 +446,7 @@ async def run(args) -> dict:
                     abl_entry = None  # Jev-max J1: filled on sampled ticks.
                     mchoice, macro_entry = None, None  # Jev-max J2.
                     fanout_rec, route_note = None, None  # Jev-max J3.
+                    discard_reason = None  # Jev-max J1: why a vote was discarded.
                     # Plan §7 cost cap: stop asking, save the game. Once hit,
                     # every remaining decision is wait (advance only); the
                     # ablation sampler below also stops (pred is synthetic).
@@ -543,6 +544,7 @@ async def run(args) -> dict:
                             actions = []
                         elif nano_force_wait:
                             # NanoJev plan §A3: save RTT, wait for state change.
+                            discard_reason = "streak"  # Jev-max J1 ablation note.
                             gate = GateDecision(
                                 "fallback", "wait",
                                 f"losing streak>={STREAK_ALARM_K}, "
@@ -664,6 +666,55 @@ async def run(args) -> dict:
                                     "kl_bits": round(kl_div_bits(
                                         pred_r.probs, pred.probs), 4),
                                 }
+                    # Jev-max J1 ablation, bypass-row arm (plan §1 literal:
+                    # EVERY 10th decision tick dual-asks, even when a hard
+                    # rule discards the vote; the executed action above is
+                    # untouched, so the trajectory never forks). Cap/skip
+                    # rows never sample (cap stops asking, skip has no ballot).
+                    if (args.ablation and abl_entry is None and not is_skip
+                            and not cap_stop
+                            and ((i + abl_offset) % _abl_every == 0)):
+                        _ab_ballot = candidates
+                        if args.backend == "laya":
+                            _ab_ballot = list_executable_candidates(
+                                candidates, snap)
+                        if len(_ab_ballot) >= 2:
+                            pred_p = await asyncio.to_thread(
+                                backend.predict, state, _ab_ballot)
+                            rich_state = attach_rich_fields(
+                                dict(state), snap)
+                            rich_json, rich_toks = state_to_json(
+                                rich_state, args.state_budget)
+                            pred_r = await asyncio.to_thread(
+                                backend.predict, rich_state, _ab_ballot)
+                            costs.append(pred_p.cost_usd)
+                            costs.append(pred_r.cost_usd)
+                            _tp = top1_of(pred_p.probs)
+                            _tr = top1_of(pred_r.probs)
+                            abl_entry = {
+                                "poor_hash": hashlib.sha1(
+                                    state_json.encode()).hexdigest()[:12],
+                                "rich_hash": hashlib.sha1(
+                                    rich_json.encode()).hexdigest()[:12],
+                                "poor_choice": pred_p.choice,
+                                "poor_probs": pred_p.probs,
+                                "poor_conf": pred_p.confidence,
+                                "rich_choice": pred_r.choice,
+                                "rich_probs": pred_r.probs,
+                                "rich_conf": pred_r.confidence,
+                                "rich_tokens": rich_toks,
+                                "rich_latency_ms": round(
+                                    pred_r.latency_ms, 1),
+                                "rich_cost_usd": pred_r.cost_usd,
+                                "poor_top1": _tp,
+                                "rich_top1": _tr,
+                                "flipped": bool(_tp != _tr),
+                                "kl_bits": round(kl_div_bits(
+                                    pred_r.probs, pred_p.probs), 4),
+                                "discarded_by": (
+                                    fix_tag if fix_tag is not None
+                                    else (discard_reason or "unknown")),
+                            }
                     if is_skip:
                         moved, interrupted = await ex.advance(args.ticks_per_decision)
                         entry = make_skip_entry(
@@ -815,6 +866,9 @@ async def run(args) -> dict:
     _abl_rows = [e["ablation"] for e in decisions_log if e.get("ablation")]
     _abl_flips = sum(1 for a in _abl_rows if a.get("flipped"))
     _abl_kl = [float(a.get("kl_bits", 0.0) or 0.0) for a in _abl_rows]
+    _abl_voted = [a for a in _abl_rows if not a.get("discarded_by")]
+    _abl_vflips = sum(1 for a in _abl_voted if a.get("flipped"))
+    _abl_vkl = [float(a.get("kl_bits", 0.0) or 0.0) for a in _abl_voted]
     # Jev-max J3: fan-out tallies (Noul/Score truly wired into stats).
     _fo_rows = [e.get("jev_fanout") or {} for e in decisions_log
                 if e.get("jev_fanout")]
@@ -857,9 +911,13 @@ async def run(args) -> dict:
             "every": _abl_every,
             "offset": abl_offset,
             "n": len(_abl_rows),
+            "n_voted": len(_abl_voted),
+            "n_discarded": len(_abl_rows) - len(_abl_voted),
             "flips": _abl_flips,
             "flip_rate": round(_abl_flips / len(_abl_rows), 4) if _abl_rows else 0.0,
             "mean_kl_bits": round(sum(_abl_kl) / len(_abl_kl), 4) if _abl_kl else 0.0,
+            "voted_flip_rate": round(_abl_vflips / len(_abl_voted), 4) if _abl_voted else 0.0,
+            "voted_mean_kl_bits": round(sum(_abl_vkl) / len(_abl_vkl), 4) if _abl_vkl else 0.0,
         },
         "cost_cap": {"cap_usd": args.cost_cap, "hit": cap_hit,
                      "hit_at_i": cap_hit_i},
